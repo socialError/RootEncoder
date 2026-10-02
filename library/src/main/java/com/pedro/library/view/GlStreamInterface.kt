@@ -89,6 +89,8 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
   private var aspectRatioMode = AspectRatioMode.Adjust
   private var executor: ExecutorService? = null
   private val fpsLimiter = FpsLimiter()
+  //limit only the stream encoder surface, used when stream fps is lower than record fps
+  private val streamFpsLimiter = FpsLimiter()
   private val forceRender = ForceRenderer()
   var autoHandleOrientation = false
   private var shouldHandleOrientation = true
@@ -278,6 +280,7 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
     }
     val timestamp = glTimestamp.getTimestamp(surfaceTexture.timestamp, clockTimestamp)
     val limitFps = fpsLimiter.limitFPS(timestamp)
+    val limitStreamFps = limitFps || streamFpsLimiter.limitFPS(timestamp)
 
     val orientation = when (orientationForced) {
       OrientationForced.PORTRAIT -> true
@@ -293,7 +296,7 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
       mainRender.drawFilters(false)
     }
     // render VideoEncoder (stream and record)
-    if (surfaceManagerEncoder.isReady && mainRender.isReady() && !limitFps) {
+    if (surfaceManagerEncoder.isReady && mainRender.isReady() && !limitStreamFps) {
       val w = if (muteVideo) 0 else encoderWidth
       val h = if (muteVideo) 0 else encoderHeight
       if (surfaceManagerEncoder.makeCurrent()) {
@@ -548,6 +551,15 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
   override fun forceFpsLimit(fps: Int) {
     glTimestamp.setFps(fps)
     fpsLimiter.setFPS(fps)
+  }
+
+  /**
+   * Limit fps of the stream encoder surface only. Record encoder surface and preview keep the fps set in forceFpsLimit.
+   *
+   * @param fps max fps of stream encoder surface. 0 to disable
+   */
+  fun setStreamFpsLimit(fps: Int) {
+    streamFpsLimiter.setFPS(fps)
   }
 
   override fun setIsStreamHorizontalFlip(flip: Boolean) {
