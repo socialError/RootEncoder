@@ -107,6 +107,8 @@ abstract class StreamBase(
    *
    * @param profile codec value from MediaCodecInfo.CodecProfileLevel class
    * @param level codec value from MediaCodecInfo.CodecProfileLevel class
+   * @param recordFps fps of the record encoder. If it is different than fps, a separate record encoder is used
+   * even with the same resolution. Stream is limited to fps and record and preview run at recordFps
    *
    * @throws IllegalArgumentException if current video parameters are not supported by the VideoSource
    * @throws IllegalArgumentException if you use differentRecordResolution but the aspect ratio is not the same than stream resolution
@@ -117,24 +119,28 @@ abstract class StreamBase(
   fun prepareVideo(
     width: Int, height: Int, bitrate: Int, fps: Int = 30, iFrameInterval: Int = 2,
     rotation: Int = 0, profile: Int = -1, level: Int = -1,
-    recordWidth: Int = 0, recordHeight: Int = 0, recordBitrate: Int = bitrate
+    recordWidth: Int = 0, recordHeight: Int = 0, recordBitrate: Int = bitrate, recordFps: Int = fps
   ): Boolean {
     if (isStreaming || isRecording || isOnPreview) {
       throw IllegalStateException("Stream, record and preview must be stopped before prepareVideo")
     }
+    //different record fps needs its own record encoder, even with the same resolution
+    val differentRecordFps = recordFps != fps
+    val finalRecordWidth = if (recordWidth <= 0 && differentRecordFps) width else recordWidth
+    val finalRecordHeight = if (recordHeight <= 0 && differentRecordFps) height else recordHeight
     differentRecordResolution = false
-    if (recordWidth > 0 && recordHeight > 0) {
-      if (recordWidth.toDouble() / recordHeight.toDouble() != width.toDouble() / height.toDouble()) {
+    if (finalRecordWidth > 0 && finalRecordHeight > 0) {
+      if (finalRecordWidth.toDouble() / finalRecordHeight.toDouble() != width.toDouble() / height.toDouble()) {
         throw IllegalArgumentException("The aspect ratio of record and stream resolution must be the same")
       }
       differentRecordResolution = true
     }
-    val videoResult = videoSource.init(max(width, recordWidth), max(height, recordHeight), fps, rotation)
+    val videoResult = videoSource.init(max(width, finalRecordWidth), max(height, finalRecordHeight), max(fps, recordFps), rotation)
     if (videoResult) {
       if (differentRecordResolution) {
         //using different record resolution
-        if (rotation == 90 || rotation == 270) glInterface.setEncoderRecordSize(recordHeight, recordWidth)
-        else glInterface.setEncoderRecordSize(recordWidth, recordHeight)
+        if (rotation == 90 || rotation == 270) glInterface.setEncoderRecordSize(finalRecordHeight, finalRecordWidth)
+        else glInterface.setEncoderRecordSize(finalRecordWidth, finalRecordHeight)
       }
       if (rotation == 90 || rotation == 270) glInterface.setEncoderSize(height, width)
       else glInterface.setEncoderSize(width, height)
@@ -143,7 +149,7 @@ abstract class StreamBase(
       glInterface.setCameraOrientation(if (rotation == 0) 270 else rotation - 90)
       glInterface.setOrientationConfig(videoSource.getOrientationConfig())
       if (differentRecordResolution) {
-        val result = videoEncoderRecord.prepareVideoEncoder(recordWidth, recordHeight, fps, recordBitrate, rotation,
+        val result = videoEncoderRecord.prepareVideoEncoder(finalRecordWidth, finalRecordHeight, recordFps, recordBitrate, rotation,
           iFrameInterval, FormatVideoEncoder.SURFACE, profile, level)
         if (!result) return false
       }
@@ -220,9 +226,12 @@ abstract class StreamBase(
    */
   fun forceFpsLimit(enabled: Boolean) {
     val fps = if (enabled) videoEncoder.fps else 0
+    val recordFps = if (enabled && differentRecordResolution) videoEncoderRecord.fps else fps
+    val sourceFps = max(fps, recordFps)
     videoEncoder.setForceFps(fps)
-    videoEncoderRecord.setForceFps(fps)
-    glInterface.forceFpsLimit(fps)
+    videoEncoderRecord.setForceFps(recordFps)
+    glInterface.forceFpsLimit(sourceFps)
+    glInterface.setStreamFpsLimit(if (fps < sourceFps) fps else 0)
   }
 
   /**
@@ -407,7 +416,8 @@ abstract class StreamBase(
         width = max(width, videoEncoderRecord.width)
         height = max(height, videoEncoderRecord.height)
       }
-      source.init(width, height, videoEncoder.fps, videoEncoder.rotation)
+      val fps = if (differentRecordResolution) max(videoEncoder.fps, videoEncoderRecord.fps) else videoEncoder.fps
+      source.init(width, height, fps, videoEncoder.rotation)
     }
     videoSource.stop()
     if (glInterface.isRunning) glInterface.surfaceTexture.tryClear()
