@@ -36,6 +36,7 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
 import android.util.Range
 import android.util.Size
@@ -51,8 +52,10 @@ import com.pedro.encoder.input.video.facedetector.mapCamera2Faces
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import kotlin.math.abs
+import kotlin.math.log2
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
@@ -73,6 +76,10 @@ import kotlin.math.roundToInt
 class Camera2ApiManager(context: Context) {
     private val TAG = "Camera2ApiManager"
 
+    private companion object {
+        const val NANOS_PER_SECOND = 1_000_000_000.0
+    }
+
     private var cameraDevice: CameraDevice? = null
     private var surfaceEncoder: Surface? = null
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -84,6 +91,7 @@ class Camera2ApiManager(context: Context) {
     private var facing = Facing.BACK
     private var builderInputSurface: CaptureRequest.Builder? = null
     private var fingerSpacing = 0f
+    @Volatile
     private var zoomLevel = 0f
     var isLanternEnabled: Boolean = false
         private set
@@ -123,6 +131,38 @@ class Camera2ApiManager(context: Context) {
     private var availabilityCallback: CameraManager.AvailabilityCallback? = null
 
     private var customCaptureCompletedCallback: ((session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) -> Unit)? = null
+
+    /**
+     * Characteristics needed to set zoom, read once per opened camera (see [getZoomInfoLocked]).
+     */
+    private class ZoomInfo(
+        val cameraId: String,
+        val range: Range<Float>,
+        val useZoomRatio: Boolean,
+        val activeArray: Rect?
+    )
+
+    /**
+     * Zoom ramp stepped by camera frames (see [animateZoom]). Log2 values of the zoom factor.
+     */
+    private class ZoomAnimation(
+        val target: Float,
+        val fromLog: Double,
+        val toLog: Double,
+        val startNs: Long,
+        val durationNs: Long
+    )
+
+    // Guards the builder and the zoom state for all new zoom code (setZoomCached, animateZoom...).
+    private val zoomLock = Any()
+    private var zoomInfo: ZoomInfo? = null
+    private var zoomAnimation: ZoomAnimation? = null
+    @Volatile
+    private var zoomTrackingEnabled = false
+    @Volatile
+    private var appliedZoom = 0f
+    @Volatile
+    private var cameraThreadHandler: Handler? = null
 
     init {
         cameraId = try { getCameraIdForFacing(Facing.BACK) } catch (_: Exception) { "0" }
@@ -173,7 +213,7 @@ class Camera2ApiManager(context: Context) {
                     try {
                         it.setRepeatingRequest(
                             captureRequest,
-                            if (faceDetectionEnabled || frameCapturedCallback != null || customCaptureCompletedCallback != null) cb else null,
+                            if (needsCaptureCallback()) cb else null,
                             handler
                         )
                     } catch (_: IllegalStateException) {
@@ -394,7 +434,7 @@ class Camera2ApiManager(context: Context) {
         try {
             cameraCaptureSession.setRepeatingRequest(
                 builder.build(),
-                if (faceDetectionEnabled || frameCapturedCallback != null || customCaptureCompletedCallback != null) cb else null, null
+                if (needsCaptureCallback()) cb else null, null
             )
             return true
         } catch (e: Exception) {
@@ -884,6 +924,7 @@ class Camera2ApiManager(context: Context) {
             request: CaptureRequest,
             result: TotalCaptureResult
         ) {
+            onZoomCaptureCompleted(result)
             customCaptureCompletedCallback?.invoke(session, request, result)
 
             val faces = result.get(CaptureResult.STATISTICS_FACES) ?: return
@@ -914,6 +955,7 @@ class Camera2ApiManager(context: Context) {
             val cameraHandlerThread = HandlerThread("$TAG Id = $cameraId")
             cameraHandlerThread.start()
             val handler = Handler(cameraHandlerThread.looper)
+            onZoomCameraOpening(handler)
             try {
                 cameraManager.openCamera(cameraId, object: CameraDevice.StateCallback() {
                     override fun onOpened(cameraDevice: CameraDevice) {
@@ -1055,12 +1097,234 @@ class Camera2ApiManager(context: Context) {
         fingerSpacing = currentFingerSpacing
     }
 
+    /*
+     * Zoom without IPC, zoom applied by the camera and a zoom ramp stepped by camera frames.
+     * New API only: the existing zoom methods (zoom, zoomRange, setZoom) are untouched.
+     *
+     * Threading: CaptureRequest.Builder is not thread safe. Everything here that touches the builder
+     * or the zoom state runs under zoomLock. cb can arrive on the camera thread or on the caller's
+     * looper (applyRequest passes a null handler), so nothing here assumes a thread.
+     * Old methods (tapToFocus, enableAutoFocus...) don't know zoomLock: call stopZoomAnimation() first.
+     */
+
+    /** Range from cache, read once per opened camera. */
+    fun getZoomRangeCached(): Range<Float> {
+        synchronized(zoomLock) {
+            return getZoomInfoLocked()?.range ?: Range(1f, 1f)
+        }
+    }
+
+    /**
+     * Same as the zoom setter, but without IPC (characteristics from cache).
+     * Returns true only when the request actually went to the capture session.
+     * Stops a running animateZoom().
+     */
+    fun setZoomCached(level: Float): Boolean {
+        synchronized(zoomLock) {
+            zoomAnimation = null
+            return setZoomLevelLocked(level)
+        }
+    }
+
+    /** Enables reading the applied zoom from capture results (attaches cb). */
+    fun setZoomTrackingEnabled(enabled: Boolean) {
+        synchronized(zoomLock) {
+            if (zoomTrackingEnabled == enabled) return
+            zoomTrackingEnabled = enabled
+            if (!enabled) {
+                zoomAnimation = null
+                appliedZoom = 0f
+            }
+            //re-send the current request so cb is attached / detached right away
+            builderInputSurface?.let { sendRepeatingLocked(it) }
+        }
+    }
+
+    /** Zoom from the last TotalCaptureResult, 0f when not known yet. */
+    fun getAppliedZoom(): Float = appliedZoom
+
+    /**
+     * Ramps the zoom from the current value to target at rate doublings per second
+     * (linear in log2, same as ZoomScale.rampDurationMs in the app).
+     * One step per real camera frame, on the camera thread - independent of the main thread.
+     * Requires setZoomTrackingEnabled(true). Returns false when it cannot start (no session).
+     */
+    fun animateZoom(target: Float, rate: Float): Boolean {
+        synchronized(zoomLock) {
+            zoomAnimation = null
+            val from = zoomLevel
+            if (!zoomTrackingEnabled || from <= 0f || rate <= 0f) return false
+            val info = getZoomInfoLocked() ?: return false
+            val to = target.coerceIn(info.range.lower, info.range.upper)
+            val fromLog = log2(from.toDouble())
+            val toLog = log2(to.toDouble())
+            val durationNs = (abs(toLog - fromLog) / rate * NANOS_PER_SECOND).toLong()
+            zoomAnimation = ZoomAnimation(to, fromLog, toLog, SystemClock.elapsedRealtimeNanos(), durationNs)
+            //first step right away: checks the session and moves cb to the camera thread
+            return stepZoomAnimationLocked()
+        }
+    }
+
+    fun stopZoomAnimation() {
+        synchronized(zoomLock) {
+            zoomAnimation = null
+        }
+    }
+
+    fun isZoomAnimating(): Boolean {
+        synchronized(zoomLock) {
+            return zoomAnimation != null
+        }
+    }
+
+    private fun needsCaptureCallback(): Boolean {
+        return faceDetectionEnabled || frameCapturedCallback != null || customCaptureCompletedCallback != null
+            || zoomTrackingEnabled
+    }
+
+    private fun onZoomCameraOpening(handler: Handler) {
+        synchronized(zoomLock) {
+            cameraThreadHandler = handler
+            zoomInfo = null
+        }
+    }
+
+    private fun onZoomCameraClosing() {
+        synchronized(zoomLock) {
+            zoomAnimation = null
+            zoomInfo = null
+            appliedZoom = 0f
+        }
+    }
+
+    private fun onZoomCaptureCompleted(result: CaptureResult) {
+        if (!zoomTrackingEnabled) return
+        synchronized(zoomLock) {
+            val applied = readAppliedZoom(result, getZoomInfoLocked())
+            if (applied > 0f) appliedZoom = applied
+            stepZoomAnimationLocked()
+        }
+    }
+
+    /**
+     * One animation step: at most one request per camera frame. Ends the animation at the exact
+     * target, or when the request can't be sent. Returns true if the request was sent.
+     */
+    private fun stepZoomAnimationLocked(): Boolean {
+        val animation = zoomAnimation ?: return false
+        //elapsedRealtimeNanos, not SENSOR_TIMESTAMP: the sensor time base may differ
+        val elapsedNs = SystemClock.elapsedRealtimeNanos() - animation.startNs
+        val finished = elapsedNs >= animation.durationNs
+        val level = if (finished) {
+            animation.target
+        } else {
+            val t = elapsedNs.toDouble() / animation.durationNs
+            2.0.pow(animation.fromLog + (animation.toLog - animation.fromLog) * t).toFloat()
+        }
+        val sent = setZoomLevelLocked(level)
+        if (finished || !sent) zoomAnimation = null
+        return sent
+    }
+
+    /** zoomLevel changes only when the request really went to the capture session. */
+    private fun setZoomLevelLocked(level: Float): Boolean {
+        val builderInputSurface = this.builderInputSurface ?: return false
+        val info = getZoomInfoLocked() ?: return false
+        val l = level.coerceIn(info.range.lower, info.range.upper)
+        if (!applyZoomToBuilder(builderInputSurface, info, l)) return false
+        val sent = sendRepeatingLocked(builderInputSurface)
+        if (sent) zoomLevel = l
+        return sent
+    }
+
+    /** Same computation as the zoom setter, with characteristics from cache. */
+    private fun applyZoomToBuilder(builder: CaptureRequest.Builder, info: ZoomInfo, level: Float): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && info.useZoomRatio) {
+            builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, level)
+            return true
+        }
+        val rect = info.activeArray ?: return false
+        //This ratio is the ratio of cropped Rect to Camera's original(Maximum) Rect
+        val ratio = 1f / level
+        //croppedWidth and croppedHeight are the pixels cropped away, not pixels after cropped
+        val croppedWidth = rect.width() - (rect.width().toFloat() * ratio).roundToInt()
+        val croppedHeight = rect.height() - (rect.height().toFloat() * ratio).roundToInt()
+        //Finally, zoom represents the zoomed visible area
+        val zoom = Rect(
+            croppedWidth / 2, croppedHeight / 2, rect.width() - croppedWidth / 2,
+            rect.height() - croppedHeight / 2
+        )
+        builder.set(CaptureRequest.SCALER_CROP_REGION, zoom)
+        return true
+    }
+
+    private fun sendRepeatingLocked(builder: CaptureRequest.Builder): Boolean {
+        val cameraCaptureSession = this.cameraCaptureSession ?: return false
+        return try {
+            cameraCaptureSession.setRepeatingRequest(
+                builder.build(),
+                if (needsCaptureCallback()) cb else null,
+                cameraThreadHandler
+            )
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error", e)
+            false
+        }
+    }
+
+    /**
+     * Zoom from the capture result, read the same way it was set: CONTROL_ZOOM_RATIO on the
+     * zoom ratio path (legacy HALs report a fixed 1.0 there), otherwise active array / crop region.
+     */
+    private fun readAppliedZoom(result: CaptureResult, info: ZoomInfo?): Float {
+        if (info == null) return 0f
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && info.useZoomRatio) {
+            return result.get(CaptureResult.CONTROL_ZOOM_RATIO) ?: 0f
+        }
+        val activeArray = info.activeArray ?: return 0f
+        val crop = result.get(CaptureResult.SCALER_CROP_REGION) ?: return 0f
+        if (crop.width() <= 0) return 0f
+        return activeArray.width().toFloat() / crop.width()
+    }
+
+    /** Filled lazily once per opened camera, cleared in openCameraId and closeCamera. */
+    private fun getZoomInfoLocked(): ZoomInfo? {
+        val cached = zoomInfo
+        if (cached != null && cached.cameraId == cameraId) return cached
+        val id = cameraId
+        val characteristics = try {
+            cameraManager.getCameraCharacteristics(id)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error", e)
+            return null
+        }
+        //same conditions as zoomRange and the zoom setter
+        val level = characteristics.secureGet(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: -1
+        val useZoomRatio = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && level != CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY
+        var range: Range<Float>? = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && useZoomRatio) {
+            range = characteristics.secureGet(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        }
+        if (range == null) {
+            val maxZoom = characteristics.secureGet(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+            range = Range(1f, maxZoom)
+        }
+        val info = ZoomInfo(
+            id, range, useZoomRatio,
+            characteristics.secureGet(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        )
+        zoomInfo = info
+        return info
+    }
+
     @JvmOverloads
     fun closeCamera(resetSurface: Boolean = true) {
         isExposureLockEnabled = false
         isWhiteBalanceLockEnabled = false
         isLanternEnabled = false
         zoomLevel = 1.0f
+        onZoomCameraClosing()
         cameraCaptureSession?.close()
         cameraCaptureSession = null
         cameraDevice?.close()
