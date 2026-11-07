@@ -24,6 +24,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
@@ -36,7 +37,6 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
-import android.os.SystemClock
 import android.util.Log
 import android.util.Range
 import android.util.Size
@@ -78,6 +78,14 @@ class Camera2ApiManager(context: Context) {
 
     private companion object {
         const val NANOS_PER_SECOND = 1_000_000_000.0
+        // zoom ramp frames queued ahead of the camera. Requests reach the sensor a few frames after
+        // they are sent, so the queue must cover that lead; it grows by one each time it runs dry.
+        const val ZOOM_RAMP_QUEUED_FRAMES_MIN = 4
+        const val ZOOM_RAMP_QUEUED_FRAMES_MAX = 10
+        // weight of a new sensor timestamp delta in the frame duration estimate
+        const val FRAME_DURATION_SMOOTHING = 0.2
+        // a gap longer than this many frames (dropped frames) counts only as this much
+        const val FRAME_DURATION_MAX_GROWTH = 2.0
     }
 
     private var cameraDevice: CameraDevice? = null
@@ -139,24 +147,31 @@ class Camera2ApiManager(context: Context) {
         val cameraId: String,
         val range: Range<Float>,
         val useZoomRatio: Boolean,
-        val activeArray: Rect?
+        val activeArray: Rect?,
+        val pipelineMaxDepth: Int
     )
 
     /**
-     * Zoom ramp stepped by camera frames (see [animateZoom]). Log2 values of the zoom factor.
+     * Zoom ramp stepped by camera frames (see [animateZoom]). toLog is log2 of the target, rate is
+     * in doublings per second.
      */
     private class ZoomAnimation(
         val target: Float,
-        val fromLog: Double,
         val toLog: Double,
-        val startNs: Long,
-        val durationNs: Long
+        val rate: Float
     )
 
     // Guards the builder and the zoom state for all new zoom code (setZoomCached, animateZoom...).
     private val zoomLock = Any()
     private var zoomInfo: ZoomInfo? = null
     private var zoomAnimation: ZoomAnimation? = null
+    // single-frame ramp captures sent to the session whose frame hasn't started yet (identity, not equals)
+    private val zoomRampRequests = mutableListOf<CaptureRequest>()
+    private var zoomRampQueueSize = ZOOM_RAMP_QUEUED_FRAMES_MIN
+    // a ramp frame of the running ramp has started, so a non-ramp frame now means the queue ran dry
+    private var zoomRampFrameStarted = false
+    private var frameDurationNs = 0.0
+    private var lastSensorTimestamp = 0L
     @Volatile
     private var zoomTrackingEnabled = false
     @Volatile
@@ -941,10 +956,19 @@ class Camera2ApiManager(context: Context) {
             timestamp: Long,
             frameNumber: Long
         ) {
+            onZoomCaptureStarted(request, timestamp)
             frameCapturedCallback?.onFrameCaptured(
                 frameNumber = frameNumber,
                 timestamp = timestamp
             )
+        }
+
+        override fun onCaptureFailed(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            failure: CaptureFailure
+        ) {
+            onZoomCaptureFailed(request)
         }
     }
 
@@ -1117,7 +1141,7 @@ class Camera2ApiManager(context: Context) {
     /**
      * Same as the zoom setter, but without IPC (characteristics from cache).
      * Returns true only when the request actually went to the capture session.
-     * Stops a running animateZoom().
+     * Stops a running animateZoom(). Ramp frames already queued still play first.
      */
     fun setZoomCached(level: Float): Boolean {
         synchronized(zoomLock) {
@@ -1148,23 +1172,34 @@ class Camera2ApiManager(context: Context) {
      * (linear in log2, same as ZoomScale.rampDurationMs in the app).
      * One step per real camera frame, on the camera thread - independent of the main thread.
      * Requires setZoomTrackingEnabled(true). Returns false when it cannot start (no session).
+     *
+     * Each step is its own single-frame capture: the camera consumes queued captures in order, one per
+     * frame, so no step is lost or repeated (replacing the repeating request per step did both, when
+     * two capture results arrived within one frame). The step is rate x measured frame duration.
+     * The camera takes requests a few frames ahead, so the queue starts at the pipeline depth; a started
+     * ramp frame queues the next one. The repeating request always holds the last queued step, so a
+     * frame the queue doesn't cover holds the zoom (the queue then grows by one) and the zoom stays on
+     * the target after the ramp. A new animateZoom continues after the frames already queued, so the
+     * ramp never jumps back.
      */
     fun animateZoom(target: Float, rate: Float): Boolean {
         synchronized(zoomLock) {
             zoomAnimation = null
-            val from = zoomLevel
-            if (!zoomTrackingEnabled || from <= 0f || rate <= 0f) return false
+            if (!zoomTrackingEnabled || zoomLevel <= 0f || rate <= 0f) return false
             val info = getZoomInfoLocked() ?: return false
             val to = target.coerceIn(info.range.lower, info.range.upper)
-            val fromLog = log2(from.toDouble())
-            val toLog = log2(to.toDouble())
-            val durationNs = (abs(toLog - fromLog) / rate * NANOS_PER_SECOND).toLong()
-            zoomAnimation = ZoomAnimation(to, fromLog, toLog, SystemClock.elapsedRealtimeNanos(), durationNs)
-            //first step right away: checks the session and moves cb to the camera thread
-            return stepZoomAnimationLocked()
+            if (zoomRampRequests.isEmpty()) zoomRampFrameStarted = false
+            zoomRampQueueSize = max(zoomRampQueueSize, info.pipelineMaxDepth)
+                .coerceIn(ZOOM_RAMP_QUEUED_FRAMES_MIN, ZOOM_RAMP_QUEUED_FRAMES_MAX)
+            zoomAnimation = ZoomAnimation(to, log2(to.toDouble()), rate)
+            fillZoomRampQueueLocked()
+            val started = zoomRampRequests.isNotEmpty()
+            if (!started) zoomAnimation = null
+            return started
         }
     }
 
+    /** Stops the ramp. Ramp frames already queued still play, the zoom then stays on the last of them. */
     fun stopZoomAnimation() {
         synchronized(zoomLock) {
             zoomAnimation = null
@@ -1194,6 +1229,10 @@ class Camera2ApiManager(context: Context) {
             zoomAnimation = null
             zoomInfo = null
             appliedZoom = 0f
+            //queued captures die with the session, their callbacks never come
+            zoomRampRequests.clear()
+            frameDurationNs = 0.0
+            lastSensorTimestamp = 0L
         }
     }
 
@@ -1202,29 +1241,97 @@ class Camera2ApiManager(context: Context) {
         synchronized(zoomLock) {
             val applied = readAppliedZoom(result, getZoomInfoLocked())
             if (applied > 0f) appliedZoom = applied
-            stepZoomAnimationLocked()
         }
     }
 
     /**
-     * One animation step: at most one request per camera frame. Ends the animation at the exact
-     * target, or when the request can't be sent. Returns true if the request was sent.
+     * Sensor started a frame: if it is a ramp frame, the next one is queued. Done here, not on
+     * completion, which comes a few frames later.
      */
-    private fun stepZoomAnimationLocked(): Boolean {
-        val animation = zoomAnimation ?: return false
-        //elapsedRealtimeNanos, not SENSOR_TIMESTAMP: the sensor time base may differ
-        val elapsedNs = SystemClock.elapsedRealtimeNanos() - animation.startNs
-        val finished = elapsedNs >= animation.durationNs
-        val level = if (finished) {
-            animation.target
-        } else {
-            val t = elapsedNs.toDouble() / animation.durationNs
-            2.0.pow(animation.fromLog + (animation.toLog - animation.fromLog) * t).toFloat()
+    private fun onZoomCaptureStarted(request: CaptureRequest, sensorTimestamp: Long) {
+        if (!zoomTrackingEnabled) return
+        synchronized(zoomLock) {
+            //deltas only, so the sensor time base doesn't matter
+            updateFrameDurationLocked(sensorTimestamp)
+            //identity: CaptureRequest.equals compares settings, the repeating request can be equal
+            val index = zoomRampRequests.indexOfFirst { it === request }
+            if (index >= 0) {
+                zoomRampRequests.removeAt(index)
+                zoomRampFrameStarted = true
+            }
+            else if (zoomAnimation != null && zoomRampFrameStarted && zoomRampQueueSize < ZOOM_RAMP_QUEUED_FRAMES_MAX) {
+                //the queue ran dry, this frame repeated the last ramp frame
+                zoomRampQueueSize++
+            }
+            fillZoomRampQueueLocked()
         }
-        val sent = setZoomLevelLocked(level)
-        if (finished || !sent) zoomAnimation = null
-        return sent
     }
+
+    private fun onZoomCaptureFailed(request: CaptureRequest) {
+        if (!zoomTrackingEnabled) return
+        synchronized(zoomLock) {
+            val index = zoomRampRequests.indexOfFirst { it === request }
+            if (index >= 0) {
+                zoomRampRequests.removeAt(index)
+                fillZoomRampQueueLocked()
+            }
+        }
+    }
+
+    private fun updateFrameDurationLocked(sensorTimestamp: Long) {
+        val delta = (sensorTimestamp - lastSensorTimestamp).toDouble()
+        if (lastSensorTimestamp > 0L && delta > 0.0) {
+            frameDurationNs = if (frameDurationNs <= 0.0) {
+                delta
+            } else {
+                val bounded = min(delta, frameDurationNs * FRAME_DURATION_MAX_GROWTH)
+                frameDurationNs + (bounded - frameDurationNs) * FRAME_DURATION_SMOOTHING
+            }
+        }
+        lastSensorTimestamp = sensorTimestamp
+    }
+
+    private fun fillZoomRampQueueLocked() {
+        while (zoomAnimation != null && zoomRampRequests.size < zoomRampQueueSize) {
+            if (!queueZoomRampFrameLocked()) zoomAnimation = null
+        }
+    }
+
+    /**
+     * Queues the next ramp frame one step after the last queued one (zoomLevel), and makes it the
+     * repeating request too: the camera falls back to the repeating request only once all queued
+     * captures are taken. Ends the animation on the exact target. Returns false when it can't be sent.
+     */
+    private fun queueZoomRampFrameLocked(): Boolean {
+        val animation = zoomAnimation ?: return false
+        val builderInputSurface = this.builderInputSurface ?: return false
+        val session = this.cameraCaptureSession ?: return false
+        val info = getZoomInfoLocked() ?: return false
+        val durationNs = if (frameDurationNs > 0.0) frameDurationNs else NANOS_PER_SECOND / max(1, fps)
+        val stepLog = animation.rate * durationNs / NANOS_PER_SECOND
+        val currentLog = log2(zoomLevel.toDouble())
+        val nextLog = if (animation.toLog > currentLog) {
+            min(currentLog + stepLog, animation.toLog)
+        } else {
+            max(currentLog - stepLog, animation.toLog)
+        }
+        val finished = nextLog == animation.toLog
+        val level = if (finished) animation.target else 2.0.pow(nextLog).toFloat().coerceIn(info.range.lower, info.range.upper)
+        if (!applyZoomToBuilder(builderInputSurface, info, level)) return false
+        return try {
+            val frameRequest = builderInputSurface.build()
+            session.capture(frameRequest, cb, cameraThreadHandler)
+            zoomRampRequests.add(frameRequest)
+            zoomLevel = level
+            if (finished) zoomAnimation = null
+            sendRepeatingLocked(builderInputSurface)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error", e)
+            false
+        }
+    }
+
 
     /** zoomLevel changes only when the request really went to the capture session. */
     private fun setZoomLevelLocked(level: Float): Boolean {
@@ -1312,7 +1419,8 @@ class Camera2ApiManager(context: Context) {
         }
         val info = ZoomInfo(
             id, range, useZoomRatio,
-            characteristics.secureGet(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            characteristics.secureGet(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE),
+            characteristics.secureGet(CameraCharacteristics.REQUEST_PIPELINE_MAX_DEPTH)?.toInt() ?: 0
         )
         zoomInfo = info
         return info
