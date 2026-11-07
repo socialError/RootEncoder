@@ -175,6 +175,40 @@ class Camera2Source(context: Context): VideoSource() {
 
   fun getZoom(): Float = camera.zoom
 
+  /** Zoom range read once per opened camera (no IPC on every call like getZoomRange). */
+  fun getZoomRangeCached(): Range<Float> = camera.getZoomRangeCached()
+
+  /**
+   * Like setZoom, without IPC. Returns true only when the request actually went to the capture
+   * session, so getZoom() matches right after it. Stops a running animateZoom().
+   */
+  fun setZoomCached(level: Float): Boolean {
+    return if (isRunning()) camera.setZoomCached(level) else false
+  }
+
+  /** Enables reading the zoom applied by the camera from capture results. Can be called before start. */
+  fun setZoomTrackingEnabled(enabled: Boolean) {
+    camera.setZoomTrackingEnabled(enabled)
+  }
+
+  /** Zoom from the last capture result, 0f when not known yet. Lags getZoom() by a few frames. */
+  fun getAppliedZoom(): Float = camera.getAppliedZoom()
+
+  /**
+   * Ramps the zoom to target at rate doublings per second, one step per camera frame on the camera
+   * thread. Requires setZoomTrackingEnabled(true). Returns false when it cannot start.
+   * Call stopZoomAnimation() before tapToFocus / enableAutoFocus.
+   */
+  fun animateZoom(target: Float, rate: Float): Boolean {
+    return if (isRunning()) camera.animateZoom(target, rate) else false
+  }
+
+  fun stopZoomAnimation() {
+    camera.stopZoomAnimation()
+  }
+
+  fun isZoomAnimating(): Boolean = camera.isZoomAnimating()
+
   fun enableFaceDetection(callback: FaceDetectorCallback): Boolean {
     return if (isRunning()) camera.enableFaceDetection(callback) else false
   }
