@@ -91,6 +91,8 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
   private val fpsLimiter = FpsLimiter()
   //limit only the stream encoder surface, used when stream fps is lower than record fps
   private val streamFpsLimiter = FpsLimiter()
+  //limit only the preview surfaces, used to save energy when record fps is high
+  private val previewFpsLimiter = FpsLimiter()
   private val forceRender = ForceRenderer()
   var autoHandleOrientation = false
   private var shouldHandleOrientation = true
@@ -281,6 +283,7 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
     val timestamp = glTimestamp.getTimestamp(surfaceTexture.timestamp, clockTimestamp)
     val limitFps = fpsLimiter.limitFPS(timestamp)
     val limitStreamFps = limitFps || streamFpsLimiter.limitFPS(timestamp)
+    val limitPreviewFps = limitFps || previewFpsLimiter.limitFPS(timestamp)
 
     val orientation = when (orientationForced) {
       OrientationForced.PORTRAIT -> true
@@ -329,7 +332,7 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
       }
     }
     // render preview
-    if (surfaceManagerPreview.isReady && mainRender.isReady() && !limitFps) {
+    if (surfaceManagerPreview.isReady && mainRender.isReady() && !limitPreviewFps) {
       val w =  if (previewWidth == 0) encoderWidth else previewWidth
       val h =  if (previewHeight == 0) encoderHeight else previewHeight
       if (surfaceManager.makeCurrent()) {
@@ -343,7 +346,7 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
       }
     }
     // render extra multi-preview surfaces (using independent configuration from PreviewSurfaceInfo)
-    if (multiPreviewSurfaceManagers.isNotEmpty() && mainRender.isReady() && !limitFps) {
+    if (multiPreviewSurfaceManagers.isNotEmpty() && mainRender.isReady() && !limitPreviewFps) {
       // Only draw filters if default preview is not active (to avoid double drawing)
       if (!surfaceManagerPreview.isReady) {
         if (surfaceManager.makeCurrent()) {
@@ -560,6 +563,16 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
    */
   fun setStreamFpsLimit(fps: Int) {
     streamFpsLimiter.setFPS(fps)
+  }
+
+  /**
+   * Limit fps of the preview surfaces only (default and multi-preview). Stream and record encoder surfaces
+   * keep every frame, so this only saves energy spent on drawing the preview.
+   *
+   * @param fps max fps of preview surfaces. 0 to disable
+   */
+  fun setPreviewFpsLimit(fps: Int) {
+    previewFpsLimiter.setFPS(fps)
   }
 
   override fun setIsStreamHorizontalFlip(flip: Boolean) {
