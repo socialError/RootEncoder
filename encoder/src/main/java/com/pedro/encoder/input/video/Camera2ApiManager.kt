@@ -786,6 +786,8 @@ class Camera2ApiManager(context: Context) {
                 focusPoint = previous
                 return false
             }
+            // the camera may keep scanning the old point after a second START: cancel it first
+            val previousScanRunning = focusScanActive
             cancelFocusHoldLocked()
             focusScanId++
             builder.setTag("")
@@ -798,13 +800,11 @@ class Camera2ApiManager(context: Context) {
                 focusScanActive = true
                 // Repeating AUTO first, then the trigger (CameraX order): a frame from the old
                 // continuous request can't land right after the trigger and reset the scan.
-                val scanning = sendRepeatingLocked(builder) && triggerAutoFocusScanLocked(builder, session)
-                if (!scanning) cancelFocusScanLocked()
-                if (continuousMode == null) {
+                val scanning = sendRepeatingLocked(builder) &&
+                    triggerAutoFocusScanLocked(builder, session, previousScanRunning)
+                if (scanning) holdFocusLocked() else cancelFocusScanLocked()
+                if (continuousMode == null || scanning) {
                     scanning
-                } else if (scanning) {
-                    holdFocusLocked()
-                    true
                 } else {
                     // No scan started: don't leave the lens locked in AUTO.
                     builder.set(CaptureRequest.CONTROL_AF_MODE, continuousMode)
@@ -822,9 +822,19 @@ class Camera2ApiManager(context: Context) {
     /**
      * One capture with AF_TRIGGER_START, queued after any zoom ramp frames (same zoom as the last
      * of them). The repeating request keeps AUTO with an idle trigger, so the lens locks.
+     * cancelPrevious: an AF_TRIGGER_CANCEL capture first, so a scan still running for the previous
+     * tap can't lock and be taken for this one.
      */
-    private fun triggerAutoFocusScanLocked(builder: CaptureRequest.Builder, session: CameraCaptureSession): Boolean {
+    private fun triggerAutoFocusScanLocked(
+        builder: CaptureRequest.Builder,
+        session: CameraCaptureSession,
+        cancelPrevious: Boolean
+    ): Boolean {
         return try {
+            if (cancelPrevious) {
+                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+                session.capture(builder.build(), null, cameraThreadHandler)
+            }
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
             val request = builder.build()
             focusTriggerRequest = request
@@ -840,8 +850,9 @@ class Camera2ApiManager(context: Context) {
     }
 
     /**
-     * Fallback for a camera that never reports the end of the scan: after FOCUS_SCAN_HOLD_MS back to
-     * continuous AF anyway. Normally onFocusScanResult() does it as soon as the lens locks.
+     * Fallback for a camera that never reports the end of the scan (or a lost trigger frame): after
+     * FOCUS_SCAN_HOLD_MS the scan ends anyway. Normally onFocusScanResult() ends it as soon as the
+     * lens locks.
      */
     private fun holdFocusLocked() {
         val handler = cameraThreadHandler ?: return
@@ -857,13 +868,16 @@ class Camera2ApiManager(context: Context) {
         handler.postDelayed(runnable, FOCUS_SCAN_HOLD_MS)
     }
 
-    /** After the scan, back to continuous AF on the same point (the mode change starts a new passive scan). */
+    /**
+     * Ends the scan: back to continuous AF on the same point (the mode change starts a new passive
+     * scan). Without a continuous mode the lens stays locked in AUTO; the request is sent again only
+     * to drop the capture callback the scan needed.
+     */
     private fun resumeContinuousFocusLocked() {
         val continuousMode = focusScanContinuousMode
         cancelFocusHoldLocked()
         val builder = builderInputSurface ?: return
-        if (continuousMode == null) return
-        builder.set(CaptureRequest.CONTROL_AF_MODE, continuousMode)
+        continuousMode?.let { builder.set(CaptureRequest.CONTROL_AF_MODE, it) }
         builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
         sendRepeatingLocked(builder)
     }
@@ -881,16 +895,31 @@ class Camera2ApiManager(context: Context) {
         focusScanContinuousMode = null
     }
 
-    /** Frame number of the AF_TRIGGER_START capture: the scan's state counts only after it. */
+    /**
+     * Frame number of the AF_TRIGGER_START capture: the scan's state counts only after it. A failed
+     * frame still has a number and 3A usually handled its trigger; if not, the hold ends the scan.
+     */
     private val focusTriggerCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(
             session: CameraCaptureSession,
             request: CaptureRequest,
             result: TotalCaptureResult
         ) {
-            synchronized(zoomLock) {
-                if (request === focusTriggerRequest) focusTriggerFrame = result.frameNumber
-            }
+            onFocusTriggerFrame(request, result.frameNumber)
+        }
+
+        override fun onCaptureFailed(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            failure: CaptureFailure
+        ) {
+            onFocusTriggerFrame(request, failure.frameNumber)
+        }
+    }
+
+    private fun onFocusTriggerFrame(request: CaptureRequest, frameNumber: Long) {
+        synchronized(zoomLock) {
+            if (request === focusTriggerRequest) focusTriggerFrame = frameNumber
         }
     }
 
@@ -906,7 +935,6 @@ class Camera2ApiManager(context: Context) {
                 finished = true
                 finishedScanId = focusScanId
                 success = afState == CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED
-                // AF without a continuous mode stays locked in AUTO, only the hold ends
                 resumeContinuousFocusLocked()
             }
         }
