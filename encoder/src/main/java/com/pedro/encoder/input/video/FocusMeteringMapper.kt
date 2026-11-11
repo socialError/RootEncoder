@@ -14,6 +14,15 @@ internal object FocusMeteringMapper {
     const val REGION_FRACTION = 0.15
 
     /**
+     * Clockwise degrees the sensor image is rotated by to look upright on a display rotated by
+     * displayDegrees (front cameras are mirrored, so their sensor turns the other way).
+     */
+    fun relativeRotation(sensorOrientation: Int, displayDegrees: Int, isFront: Boolean): Int {
+        return if (isFront) (sensorOrientation + displayDegrees) % 360
+        else (sensorOrientation - displayDegrees + 360) % 360
+    }
+
+    /**
      * Normalized point (0..1) in sensor orientation, or null when the tap is outside the image
      * (black bars of an aspect-fit preview).
      *

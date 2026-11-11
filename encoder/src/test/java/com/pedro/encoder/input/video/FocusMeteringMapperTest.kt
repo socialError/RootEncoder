@@ -31,6 +31,20 @@ class FocusMeteringMapperTest {
         assertEquals(Pair(1f, 0f), FocusMeteringMapper.sensorPoint(0f, 240f, 1080, 2400, 1280, 720, 270, false))
     }
 
+    @Test fun relativeRotation() {
+        // back sensor 90: upright in portrait after 90, aligned in landscape (display 90)
+        assertEquals(90, FocusMeteringMapper.relativeRotation(90, 0, false))
+        assertEquals(0, FocusMeteringMapper.relativeRotation(90, 90, false))
+        assertEquals(180, FocusMeteringMapper.relativeRotation(90, 270, false))
+        // back sensor 270 (mounted upside down)
+        assertEquals(180, FocusMeteringMapper.relativeRotation(270, 90, false))
+        assertEquals(0, FocusMeteringMapper.relativeRotation(270, 270, false))
+        // front sensor 270
+        assertEquals(270, FocusMeteringMapper.relativeRotation(270, 0, true))
+        assertEquals(0, FocusMeteringMapper.relativeRotation(270, 90, true))
+        assertEquals(180, FocusMeteringMapper.relativeRotation(270, 270, true))
+    }
+
     @Test fun frontCameraIsMirrored() {
         assertEquals(Pair(1f, 0.5f), FocusMeteringMapper.sensorPoint(240f, 540f, 2400, 1080, 1280, 720, 0, true))
     }

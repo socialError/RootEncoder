@@ -86,6 +86,8 @@ class Camera2ApiManager(context: Context) {
         const val FRAME_DURATION_SMOOTHING = 0.2
         // a gap longer than this many frames (dropped frames) counts only as this much
         const val FRAME_DURATION_MAX_GROWTH = 2.0
+        // AF stays locked on the tapped point this long before continuous AF takes over again
+        const val FOCUS_SCAN_HOLD_MS = 3000L
     }
 
     private var cameraDevice: CameraDevice? = null
@@ -119,10 +121,12 @@ class Camera2ApiManager(context: Context) {
         private set
     var isRunning: Boolean = false
         private set
-    // camera output size (sensor orientation), the tapped point is mapped through it
-    private var captureSize = Size(16, 9)
+    // camera output size (sensor orientation), the tapped point is mapped through it; null when unknown
+    private var captureSize: Size? = null
     // tapped point (tapToFocus), normalized in sensor orientation, guarded by zoomLock
     private var focusPoint: Pair<Float, Float>? = null
+    // returns AF to the continuous mode after the scan of a tap, on the camera thread, guarded by zoomLock
+    private var focusHoldRunnable: Runnable? = null
     private var fps = 30
     private val semaphore = Semaphore(0)
     private var cameraCallbacks: CameraCallbacks? = null
@@ -146,7 +150,7 @@ class Camera2ApiManager(context: Context) {
 
     /**
      * Characteristics needed to set zoom and tap metering, read once per opened camera
-     * (see [getZoomInfoLocked]). focusMode is the AF mode used by tapToFocus, null without AF.
+     * (see [getZoomInfoLocked]). continuousFocusMode is null without continuous AF.
      */
     private class ZoomInfo(
         val cameraId: String,
@@ -157,7 +161,9 @@ class Camera2ApiManager(context: Context) {
         val preCorrectionArray: Rect?,
         val maxRegionsAf: Int,
         val maxRegionsAe: Int,
-        val focusMode: Int?,
+        val continuousFocusMode: Int?,
+        val hasAutoFocusScan: Boolean,
+        val distortionCorrectionSupported: Boolean,
         val sensorOrientation: Int,
         val isFront: Boolean
     )
@@ -217,6 +223,7 @@ class Camera2ApiManager(context: Context) {
     }
 
     fun prepareCamera(surface: Surface, fps: Int) {
+        captureSize = null
         this.surfaceEncoder = surface
         this.fps = fps
         isPrepared = true
@@ -686,37 +693,44 @@ class Camera2ApiManager(context: Context) {
         }
     }
 
-    /** Tapped point in sensor orientation, normalized. Null outside the image (black bars). */
+    /**
+     * Tapped point in sensor orientation, normalized. Null outside the image (black bars).
+     * Assumes the preview shows the camera output aspect-fit (AspectRatioMode.Adjust, encoder with
+     * the same aspect ratio as the camera).
+     */
     private fun tapPoint(view: View, event: MotionEvent, info: ZoomInfo): Pair<Float, Float>? {
+        val size = captureSize ?: return null
         val displayDegrees = when (view.display?.rotation) {
             Surface.ROTATION_90 -> 90
             Surface.ROTATION_180 -> 180
             Surface.ROTATION_270 -> 270
             else -> 0
         }
-        val rotation = if (info.isFront) (info.sensorOrientation + displayDegrees) % 360
-            else (info.sensorOrientation - displayDegrees + 360) % 360
+        val rotation = FocusMeteringMapper.relativeRotation(info.sensorOrientation, displayDegrees, info.isFront)
         return FocusMeteringMapper.sensorPoint(event.x, event.y, view.width, view.height,
-            captureSize.width, captureSize.height, rotation, info.isFront)
+            size.width, size.height, rotation, info.isFront)
     }
 
     private fun meteringRegion(builder: CaptureRequest.Builder, info: ZoomInfo, point: Pair<Float, Float>): MeteringRectangle? {
-        val active = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+        val size = captureSize ?: return null
+        val array = if (info.distortionCorrectionSupported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
             builder.get(CaptureRequest.DISTORTION_CORRECTION_MODE) == CaptureRequest.DISTORTION_CORRECTION_MODE_OFF) {
             info.preCorrectionArray ?: info.activeArray
         } else info.activeArray
-        active ?: return null
+        array ?: return null
+        // region and crop coordinates start at the top-left corner of the array, not at its offset
+        val active = Rect(0, 0, array.width(), array.height())
         // zoomRatio: regions are relative to the zoomed field of view, the crop region stays the
         // active array. Legacy zoom: the crop region is the zoom, regions must lie inside it.
         val crop = Rect(builder.get(CaptureRequest.SCALER_CROP_REGION) ?: active)
         if (!crop.intersect(active)) return null
         val bounds = FocusMeteringMapper.region(point.first, point.second,
-            crop.left, crop.top, crop.right, crop.bottom, captureSize.width, captureSize.height)
+            crop.left, crop.top, crop.right, crop.bottom, size.width, size.height)
         return MeteringRectangle(bounds[0], bounds[1], bounds[2], bounds[3],
             MeteringRectangle.METERING_WEIGHT_MAX)
     }
 
-    /** Puts the AF/AE regions of the tapped point into the builder (they move with the zoom crop). */
+    /** Puts the AF/AE regions of the tapped point into the builder. */
     private fun applyFocusPointLocked(builder: CaptureRequest.Builder, info: ZoomInfo): Boolean {
         val point = focusPoint ?: return true
         val region = meteringRegion(builder, info, point) ?: return false
@@ -726,10 +740,19 @@ class Camera2ApiManager(context: Context) {
     }
 
     /**
-     * Continuous autofocus and auto exposure metered around the tapped point, like a focus and
-     * exposure point of interest on iOS. The point stays (also through zoom changes) until the camera
-     * closes or enableAutoFocus() is called. Safe while animateZoom() runs: the change goes to the
-     * next ramp frames and the repeating request, the ramp doesn't pause.
+     * Legacy zoom moves the crop region, so the regions of the tapped point must move with it.
+     * On the zoomRatio path they are relative to the zoomed view and stay valid.
+     */
+    private fun followZoomWithFocusPointLocked(builder: CaptureRequest.Builder, info: ZoomInfo) {
+        if (!info.useZoomRatio) applyFocusPointLocked(builder, info)
+    }
+
+    /**
+     * Focus and exposure on the tapped point, like a focus and exposure point of interest on iOS.
+     * AF scans the point once (AUTO + trigger, a region change alone doesn't make continuous AF
+     * rescan) and after FOCUS_SCAN_HOLD_MS goes back to continuous AF that keeps the point. AE stays
+     * continuous, metered on the point. The point stays (also through zoom changes) until the camera
+     * closes or enableAutoFocus() is called. Safe while animateZoom() runs.
      * Returns false when the camera can't meter the point (no session, tap outside the image...).
      */
     fun tapToFocus(view: View, event: MotionEvent): Boolean {
@@ -737,8 +760,8 @@ class Camera2ApiManager(context: Context) {
             val builder = builderInputSurface ?: return false
             val session = cameraCaptureSession ?: return false
             val info = getZoomInfoLocked() ?: return false
-            val focusMode = if (info.maxRegionsAf > 0) info.focusMode else null
-            if (focusMode == null && (info.maxRegionsAe == 0 || isExposureLockEnabled)) return false
+            val canFocus = info.maxRegionsAf > 0 && (info.hasAutoFocusScan || info.continuousFocusMode != null)
+            if (!canFocus && (info.maxRegionsAe == 0 || isExposureLockEnabled)) return false
             val point = tapPoint(view, event, info) ?: return false
             val previous = focusPoint
             focusPoint = point
@@ -746,39 +769,72 @@ class Camera2ApiManager(context: Context) {
                 focusPoint = previous
                 return false
             }
-            if (focusMode != null) {
-                builder.setTag("")
-                builder.set(CaptureRequest.CONTROL_AF_MODE, focusMode)
-                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
-                //continuous modes follow the regions by themselves, AUTO needs a new scan
-                if (focusMode == CaptureRequest.CONTROL_AF_MODE_AUTO) triggerAutoFocusScanLocked(builder, session)
+            cancelFocusHoldLocked()
+            builder.setTag("")
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            val sent = if (canFocus && info.hasAutoFocusScan) {
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                val scanning = triggerAutoFocusScanLocked(builder, session) && sendRepeatingLocked(builder)
+                info.continuousFocusMode?.let { if (scanning) holdFocusLocked(it) }
+                scanning
+            } else {
+                info.continuousFocusMode?.let { if (canFocus) builder.set(CaptureRequest.CONTROL_AF_MODE, it) }
+                sendRepeatingLocked(builder)
             }
-            val sent = sendRepeatingLocked(builder)
-            if (sent && focusMode != null) isAutoFocusEnabled = true
+            if (sent && canFocus) isAutoFocusEnabled = true
             return sent
         }
     }
 
-    private fun triggerAutoFocusScanLocked(builder: CaptureRequest.Builder, session: CameraCaptureSession) {
-        try {
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
-            session.capture(builder.build(), null, cameraThreadHandler)
+    /**
+     * One capture with AF_TRIGGER_START, queued after any zoom ramp frames (same zoom as the last
+     * of them). The repeating request then keeps AUTO with an idle trigger, so the lens locks.
+     */
+    private fun triggerAutoFocusScanLocked(builder: CaptureRequest.Builder, session: CameraCaptureSession): Boolean {
+        return try {
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
             session.capture(builder.build(), null, cameraThreadHandler)
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Error", e)
+            false
         } finally {
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
         }
     }
 
+    /** After the scan, back to continuous AF on the same point (the mode change starts a new passive scan). */
+    private fun holdFocusLocked(continuousMode: Int) {
+        val handler = cameraThreadHandler ?: return
+        val runnable = object : Runnable {
+            override fun run() {
+                synchronized(zoomLock) {
+                    if (focusHoldRunnable !== this) return
+                    focusHoldRunnable = null
+                    val builder = builderInputSurface ?: return
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, continuousMode)
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                    sendRepeatingLocked(builder)
+                }
+            }
+        }
+        focusHoldRunnable = runnable
+        handler.postDelayed(runnable, FOCUS_SCAN_HOLD_MS)
+    }
+
+    private fun cancelFocusHoldLocked() {
+        focusHoldRunnable?.let { cameraThreadHandler?.removeCallbacks(it) }
+        focusHoldRunnable = null
+    }
+
     /** enableAutoFocus() resets the AF regions: the tapped point and its AE region go with them. */
     private fun clearFocusPoint(builder: CaptureRequest.Builder) {
         synchronized(zoomLock) {
+            cancelFocusHoldLocked()
             if (focusPoint == null) return
             focusPoint = null
             val info = getZoomInfoLocked() ?: return
-            if (info.maxRegionsAe > 0 && !isExposureLockEnabled) {
+            if (info.maxRegionsAe > 0) {
                 clearRegions()?.let { builder.set(CaptureRequest.CONTROL_AE_REGIONS, it) }
             }
         }
@@ -1293,6 +1349,7 @@ class Camera2ApiManager(context: Context) {
             appliedZoom = 0f
             //queued captures die with the session, their callbacks never come
             zoomRampRequests.clear()
+            cancelFocusHoldLocked()
             focusPoint = null
             frameDurationNs = 0.0
             lastSensorTimestamp = 0L
@@ -1381,7 +1438,7 @@ class Camera2ApiManager(context: Context) {
         val finished = nextLog == animation.toLog
         val level = if (finished) animation.target else 2.0.pow(nextLog).toFloat().coerceIn(info.range.lower, info.range.upper)
         if (!applyZoomToBuilder(builderInputSurface, info, level)) return false
-        applyFocusPointLocked(builderInputSurface, info)
+        followZoomWithFocusPointLocked(builderInputSurface, info)
         return try {
             val frameRequest = builderInputSurface.build()
             session.capture(frameRequest, cb, cameraThreadHandler)
@@ -1403,7 +1460,7 @@ class Camera2ApiManager(context: Context) {
         val info = getZoomInfoLocked() ?: return false
         val l = level.coerceIn(info.range.lower, info.range.upper)
         if (!applyZoomToBuilder(builderInputSurface, info, l)) return false
-        applyFocusPointLocked(builderInputSurface, info)
+        followZoomWithFocusPointLocked(builderInputSurface, info)
         val sent = sendRepeatingLocked(builderInputSurface)
         if (sent) zoomLevel = l
         return sent
@@ -1483,15 +1540,18 @@ class Camera2ApiManager(context: Context) {
             range = Range(1f, maxZoom)
         }
         val afModes = characteristics.secureGet(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
-        val focusMode = when {
+        val continuousFocusMode = when {
             afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) -> CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
             afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) -> CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-            afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) -> CaptureRequest.CONTROL_AF_MODE_AUTO
             else -> null
         }
-        val preCorrectionArray = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            characteristics.secureGet(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
-        } else null
+        var preCorrectionArray: Rect? = null
+        var distortionCorrectionSupported = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            preCorrectionArray = characteristics.secureGet(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+            distortionCorrectionSupported = characteristics.secureGet(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)
+                ?.any { it != CameraMetadata.DISTORTION_CORRECTION_MODE_OFF } == true
+        }
         val info = ZoomInfo(
             id, range, useZoomRatio,
             characteristics.secureGet(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE),
@@ -1499,7 +1559,9 @@ class Camera2ApiManager(context: Context) {
             preCorrectionArray,
             characteristics.secureGet(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0,
             characteristics.secureGet(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0,
-            focusMode,
+            continuousFocusMode,
+            afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO),
+            distortionCorrectionSupported,
             characteristics.secureGet(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
             characteristics.secureGet(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_FRONT
         )
