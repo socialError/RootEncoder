@@ -109,6 +109,12 @@ class Camera2ApiManager(context: Context) {
         private set
     var isOpticalStabilizationEnabled: Boolean = false
         private set
+    // stabilization put into the first request of every session, null keeps the template default;
+    // set before the camera opens, read on the camera thread
+    @Volatile
+    private var videoStabilizationOnOpen: Boolean? = null
+    @Volatile
+    private var opticalStabilizationOnOpen: Boolean? = null
     var isAutoFocusEnabled: Boolean = true
         private set
     var isAutoExposureEnabled: Boolean = false
@@ -296,6 +302,7 @@ class Camera2ApiManager(context: Context) {
         for (surface in surfaces) builderInputSurface.addTarget(surface)
         builderInputSurface.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         if (dynamicFps) adaptFpsRangeDynamic(fps, builderInputSurface) else adaptFpsRange(fps, builderInputSurface)
+        applyStabilizationOnOpen(builderInputSurface)
         this.builderInputSurface = builderInputSurface
         return builderInputSurface.build()
     }
@@ -621,6 +628,39 @@ class Camera2ApiManager(context: Context) {
         builderInputSurface.set(CaptureRequest.CONTROL_AWB_LOCK, false)
         applyRequest(builderInputSurface)
         isWhiteBalanceLockEnabled = false
+    }
+
+    /**
+     * Video (EIS) and optical (OIS) stabilization for every following camera open; null keeps the
+     * template default. They go into the first request of the session: switching video stabilization
+     * on a running session broke the image on a Pixel 8a, and enableVideoStabilization called right
+     * after the open raced the session setup. A change takes effect on the next open or re-open.
+     */
+    fun setStabilizationOnOpen(video: Boolean?, optical: Boolean?) {
+        videoStabilizationOnOpen = video
+        opticalStabilizationOnOpen = optical
+    }
+
+    private fun applyStabilizationOnOpen(builder: CaptureRequest.Builder) {
+        val characteristics = cameraCharacteristics ?: return
+        videoStabilizationOnOpen?.let { enabled ->
+            val modes = characteristics.secureGet(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            val supported = modes?.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
+            isVideoStabilizationEnabled = enabled && supported
+            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                if (isVideoStabilizationEnabled) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+        }
+        opticalStabilizationOnOpen?.let { enabled ->
+            val modes = characteristics.secureGet(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            val supported = modes?.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+            isOpticalStabilizationEnabled = enabled && supported
+            if (supported) {
+                builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    if (isOpticalStabilizationEnabled) CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+                    else CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+            }
+        }
     }
 
     fun enableVideoStabilization(): Boolean {
@@ -1702,6 +1742,8 @@ class Camera2ApiManager(context: Context) {
         isExposureLockEnabled = false
         isWhiteBalanceLockEnabled = false
         isLanternEnabled = false
+        isVideoStabilizationEnabled = false
+        isOpticalStabilizationEnabled = false
         zoomLevel = 1.0f
         onZoomCameraClosing()
         cameraCaptureSession?.close()

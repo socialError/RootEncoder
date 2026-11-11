@@ -242,6 +242,14 @@ class Camera2Source(context: Context): VideoSource() {
     if (isRunning()) camera.reOpenCamera(id)
   }
 
+  /**
+   * Video (EIS) and optical (OIS) stabilization put into the first request of every camera open,
+   * null keeps the template default. Call before start; a change takes effect on the next re-open.
+   */
+  fun setStabilizationOnOpen(video: Boolean?, optical: Boolean?) {
+    camera.setStabilizationOnOpen(video, optical)
+  }
+
   fun enableOpticalVideoStabilization(): Boolean {
     return if (isRunning()) camera.enableOpticalVideoStabilization() else false
   }
