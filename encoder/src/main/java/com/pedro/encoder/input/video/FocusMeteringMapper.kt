@@ -1,5 +1,6 @@
 package com.pedro.encoder.input.video
 
+import android.hardware.camera2.CameraMetadata
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.min
@@ -80,5 +81,15 @@ internal object FocusMeteringMapper {
             (centerX - boxWidth / 2.0).roundToInt().coerceIn(minX, (maxX - boxWidth).coerceAtLeast(minX)),
             (centerY - boxHeight / 2.0).roundToInt().coerceIn(minY, (maxY - boxHeight).coerceAtLeast(minY)),
             boxWidth, boxHeight)
+    }
+
+    /**
+     * True when a result shows the AF scan started by the trigger frame has finished. Results up to
+     * the trigger frame still carry the state of the previous scan.
+     */
+    fun isScanFinished(afState: Int?, frameNumber: Long, triggerFrame: Long): Boolean {
+        if (triggerFrame < 0 || frameNumber <= triggerFrame) return false
+        return afState == CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+            afState == CameraMetadata.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
     }
 }

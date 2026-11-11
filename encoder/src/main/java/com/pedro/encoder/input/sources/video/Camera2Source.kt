@@ -30,6 +30,7 @@ import android.view.MotionEvent
 import android.view.View
 import androidx.annotation.RequiresApi
 import com.pedro.encoder.input.video.Camera2ApiManager
+import com.pedro.encoder.input.video.FocusListener
 import com.pedro.encoder.input.video.Camera2ApiManager.ImageCallback
 import com.pedro.encoder.input.video.CameraCallbacks
 import com.pedro.encoder.input.video.CameraHelper
@@ -152,6 +153,16 @@ class Camera2Source(context: Context): VideoSource() {
 
   fun tapToFocus(view: View, event: MotionEvent): Boolean {
     return camera.tapToFocus(view, event)
+  }
+
+  /** Result of the AF scan of each tap, on the camera thread. See FocusListener. */
+  fun setFocusListener(listener: FocusListener?) {
+    camera.setFocusListener(listener)
+  }
+
+  /** Id of the scan started by the last tapToFocus call (compare with FocusListener's scanId). */
+  fun getFocusScanId(): Int {
+    return camera.getFocusScanId()
   }
 
   fun tapToMeterExposure(view: View, event: MotionEvent): Boolean {

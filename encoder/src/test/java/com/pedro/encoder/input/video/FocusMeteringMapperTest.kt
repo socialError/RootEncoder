@@ -1,8 +1,11 @@
 package com.pedro.encoder.input.video
 
+import android.hardware.camera2.CameraMetadata
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class FocusMeteringMapperTest {
@@ -63,5 +66,19 @@ class FocusMeteringMapperTest {
             FocusMeteringMapper.region(0f, 0f, 1000, 750, 3000, 2250, 1600, 900))
         assertArrayEquals(intArrayOf(2700, 1893, 300, 169),
             FocusMeteringMapper.region(1f, 1f, 1000, 750, 3000, 2250, 1600, 900))
+    }
+
+    @Test fun scanFinishesOnlyAfterTheTriggerFrame() {
+        val focused = CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED
+        val notFocused = CameraMetadata.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
+        // locked state left over from the previous scan
+        assertFalse(FocusMeteringMapper.isScanFinished(focused, 10, 10))
+        assertFalse(FocusMeteringMapper.isScanFinished(focused, 9, 10))
+        // trigger frame not known yet
+        assertFalse(FocusMeteringMapper.isScanFinished(focused, 11, -1))
+        assertFalse(FocusMeteringMapper.isScanFinished(CameraMetadata.CONTROL_AF_STATE_ACTIVE_SCAN, 11, 10))
+        assertFalse(FocusMeteringMapper.isScanFinished(null, 11, 10))
+        assertTrue(FocusMeteringMapper.isScanFinished(focused, 11, 10))
+        assertTrue(FocusMeteringMapper.isScanFinished(notFocused, 12, 10))
     }
 }
