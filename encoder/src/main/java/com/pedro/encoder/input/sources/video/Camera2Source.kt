@@ -197,7 +197,7 @@ class Camera2Source(context: Context): VideoSource() {
   /**
    * Ramps the zoom to target at rate doublings per second, one step per camera frame on the camera
    * thread. Requires setZoomTrackingEnabled(true). Returns false when it cannot start.
-   * Call stopZoomAnimation() before tapToFocus / enableAutoFocus.
+   * Call stopZoomAnimation() before enableAutoFocus (tapToFocus is safe while it runs).
    */
   fun animateZoom(target: Float, rate: Float): Boolean {
     return if (isRunning()) camera.animateZoom(target, rate) else false

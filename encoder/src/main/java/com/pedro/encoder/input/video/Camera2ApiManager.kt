@@ -229,6 +229,13 @@ class Camera2ApiManager(context: Context) {
         isPrepared = true
     }
 
+    /** Re-open on the same surface: its buffer size is unchanged, so tap-to-focus keeps working. */
+    private fun prepareSameSurface(surface: Surface) {
+        val size = captureSize
+        prepareCamera(surface, fps)
+        captureSize = size
+    }
+
     private fun startPreview(cameraDevice: CameraDevice, handler: Handler) {
         try {
             val surface = surfaceEncoder ?: run {
@@ -774,9 +781,20 @@ class Camera2ApiManager(context: Context) {
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
             val sent = if (canFocus && info.hasAutoFocusScan) {
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-                val scanning = triggerAutoFocusScanLocked(builder, session) && sendRepeatingLocked(builder)
-                info.continuousFocusMode?.let { if (scanning) holdFocusLocked(it) }
-                scanning
+                // Repeating AUTO first, then the trigger (CameraX order): a frame from the old
+                // continuous request can't land right after the trigger and reset the scan.
+                val scanning = sendRepeatingLocked(builder) && triggerAutoFocusScanLocked(builder, session)
+                val continuousMode = info.continuousFocusMode
+                if (continuousMode == null) {
+                    scanning
+                } else if (scanning) {
+                    holdFocusLocked(continuousMode)
+                    true
+                } else {
+                    // No scan started: don't leave the lens locked in AUTO.
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, continuousMode)
+                    sendRepeatingLocked(builder)
+                }
             } else {
                 info.continuousFocusMode?.let { if (canFocus) builder.set(CaptureRequest.CONTROL_AF_MODE, it) }
                 sendRepeatingLocked(builder)
@@ -788,7 +806,7 @@ class Camera2ApiManager(context: Context) {
 
     /**
      * One capture with AF_TRIGGER_START, queued after any zoom ramp frames (same zoom as the last
-     * of them). The repeating request then keeps AUTO with an idle trigger, so the lens locks.
+     * of them). The repeating request keeps AUTO with an idle trigger, so the lens locks.
      */
     private fun triggerAutoFocusScanLocked(builder: CaptureRequest.Builder, session: CameraCaptureSession): Boolean {
         return try {
@@ -1002,6 +1020,8 @@ class Camera2ApiManager(context: Context) {
         for (mode in supportedFocusModes) {
             runCatching {
                 if (mode == CaptureRequest.CONTROL_AF_MODE_OFF) {
+                    // a pending tap hold would switch manual focus back to continuous AF
+                    clearFocusPoint(builderInputSurface)
                     builderInputSurface.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
                     applyRequest(builderInputSurface)
                     isAutoFocusEnabled = false
@@ -1162,7 +1182,7 @@ class Camera2ApiManager(context: Context) {
         val surface = surfaceEncoder
         if (cameraDevice != null && surface != null) {
             closeCamera(false)
-            prepareCamera(surface, fps)
+            prepareSameSurface(surface)
             openCameraId(cameraId)
         }
     }
@@ -1606,7 +1626,7 @@ class Camera2ApiManager(context: Context) {
         this.imageReader = imageReader
         val surface = surfaceEncoder
         if (wasRunning && surface != null) {
-            prepareCamera(surface, fps)
+            prepareSameSurface(surface)
             openLastCamera()
         }
     }
@@ -1619,7 +1639,7 @@ class Camera2ApiManager(context: Context) {
         this.imageReader = null
         val surface = surfaceEncoder
         if (wasRunning && surface != null) {
-            prepareCamera(surface, fps)
+            prepareSameSurface(surface)
             openLastCamera()
         }
     }
