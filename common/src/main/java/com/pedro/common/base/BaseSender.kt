@@ -80,7 +80,7 @@ abstract class BaseSender(
                 return
             }
             waitingForKeyFrame = false
-            Log.i(TAG, "Video sent again after discarded frames, keyframe: ${info.isKeyFrame}")
+            Log.i(TAG, "Wait for a keyframe ended, keyframe: ${info.isKeyFrame}")
         }
         val data = bufferPool.acquire(buffer.limit())
         val mediaFrame = MediaFrame(buffer.clone(data), info, type)

@@ -183,15 +183,17 @@ class BaseSenderTest {
   fun `GIVEN video waits for a keyframe WHEN audio arrives THEN audio is still sent`() = runBlocking {
     val sender = FakeSender()
     sender.forceRunning()
-    sender.resizeCache(1)
+    sender.resizeCache(2)
     sender.send(0, MediaFrame.Type.VIDEO, isKeyFrame = true)
     sender.send(1, MediaFrame.Type.VIDEO)
-    assertEquals(listOf(0L), sender.drain())
+    sender.send(2, MediaFrame.Type.VIDEO)
+    assertEquals(listOf(0L, 1L), sender.drain())
 
-    sender.send(2, MediaFrame.Type.AUDIO)
-    sender.send(3, MediaFrame.Type.VIDEO)
+    sender.send(3, MediaFrame.Type.AUDIO)
+    //the queue has room, only the wait for a keyframe drops this one
+    sender.send(4, MediaFrame.Type.VIDEO)
 
-    assertEquals(listOf(2L), sender.drain())
+    assertEquals(listOf(3L), sender.drain())
     assertEquals(2L, sender.getDroppedVideoFrames())
     assertEquals(0L, sender.getDroppedAudioFrames())
   }
@@ -243,6 +245,39 @@ class BaseSenderTest {
     sender.send(1 + limit, MediaFrame.Type.VIDEO)
 
     assertEquals(listOf(1 + limit), sender.drain())
+  }
+
+  @Test
+  fun `GIVEN a keyframe dropped on a full queue WHEN the wait goes on THEN the limit counts from that keyframe`() = runBlocking {
+    val sender = FakeSender()
+    sender.forceRunning()
+    sender.resizeCache(1)
+    val limit = BaseSender.KEYFRAME_WAIT_LIMIT_US
+    sender.send(0, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    sender.send(1, MediaFrame.Type.VIDEO)
+    sender.send(1_000_000, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    assertEquals(listOf(0L), sender.drain())
+
+    //past the limit of the first drop, still within the limit of the dropped keyframe
+    sender.send(1 + limit, MediaFrame.Type.VIDEO)
+    sender.send(1_000_000 + limit, MediaFrame.Type.VIDEO)
+
+    assertEquals(listOf(1_000_000 + limit), sender.drain())
+  }
+
+  @Test
+  fun `GIVEN video waits for a keyframe WHEN the sender starts again THEN the new stream does not wait`() = runBlocking {
+    val sender = FakeSender()
+    sender.forceRunning()
+    sender.resizeCache(1)
+    sender.send(0, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    sender.send(1, MediaFrame.Type.VIDEO)
+
+    sender.start()
+    sender.send(2, MediaFrame.Type.VIDEO)
+
+    assertEquals(listOf(2L), sender.drain())
+    sender.stop()
   }
 
   @Test
