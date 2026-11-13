@@ -30,6 +30,18 @@ class BaseSenderTest {
 
   private fun ByteBuffer.readAll(): ByteArray = ByteArray(remaining()).also { duplicate().get(it) }
 
+  private fun FakeSender.send(timestamp: Long, type: MediaFrame.Type, isKeyFrame: Boolean = false) {
+    val frame = byteArrayOf(0, 0, 0, 1, 65, 1, 2)
+    sendMediaFrame(ByteBuffer.wrap(frame), MediaFrame.Info(0, frame.size, timestamp, isKeyFrame), type)
+  }
+
+  //timestamps of the queued frames, in send order
+  private suspend fun FakeSender.drain(): List<Long> {
+    val timestamps = mutableListOf<Long>()
+    while (getItemsInCache() > 0) consumeOne { timestamps.add(it.info.timestamp) }
+    return timestamps
+  }
+
   @Test
   fun `GIVEN a frame WHEN send THEN the buffer capacity is the frame size not the pooled size`() = runBlocking {
     val sender = FakeSender()
@@ -145,5 +157,106 @@ class BaseSenderTest {
       assertEquals(small.size, fixedBuffer.remaining())
       assertArrayEquals(small, fixedBuffer.readAll())
     }
+  }
+
+  @Test
+  fun `GIVEN a full queue WHEN a video frame is dropped THEN video waits for the next keyframe`() = runBlocking {
+    val sender = FakeSender()
+    sender.forceRunning()
+    sender.resizeCache(2)
+    sender.send(0, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    sender.send(1, MediaFrame.Type.VIDEO)
+    //queue full
+    sender.send(2, MediaFrame.Type.VIDEO)
+    assertEquals(listOf(0L, 1L), sender.drain())
+
+    //there is room again, but this frame references the dropped one
+    sender.send(3, MediaFrame.Type.VIDEO)
+    sender.send(4, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    sender.send(5, MediaFrame.Type.VIDEO)
+
+    assertEquals(listOf(4L, 5L), sender.drain())
+    assertEquals(2L, sender.getDroppedVideoFrames())
+  }
+
+  @Test
+  fun `GIVEN video waits for a keyframe WHEN audio arrives THEN audio is still sent`() = runBlocking {
+    val sender = FakeSender()
+    sender.forceRunning()
+    sender.resizeCache(1)
+    sender.send(0, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    sender.send(1, MediaFrame.Type.VIDEO)
+    assertEquals(listOf(0L), sender.drain())
+
+    sender.send(2, MediaFrame.Type.AUDIO)
+    sender.send(3, MediaFrame.Type.VIDEO)
+
+    assertEquals(listOf(2L), sender.drain())
+    assertEquals(2L, sender.getDroppedVideoFrames())
+    assertEquals(0L, sender.getDroppedAudioFrames())
+  }
+
+  @Test
+  fun `GIVEN a dropped audio frame WHEN video arrives THEN video is not held back`() = runBlocking {
+    val sender = FakeSender()
+    sender.forceRunning()
+    sender.resizeCache(1)
+    sender.send(0, MediaFrame.Type.AUDIO)
+    sender.send(1, MediaFrame.Type.AUDIO)
+    assertEquals(listOf(0L), sender.drain())
+
+    sender.send(2, MediaFrame.Type.VIDEO)
+
+    assertEquals(listOf(2L), sender.drain())
+    assertEquals(1L, sender.getDroppedAudioFrames())
+    assertEquals(0L, sender.getDroppedVideoFrames())
+  }
+
+  @Test
+  fun `GIVEN the keyframe does not fit WHEN the queue is still full THEN video waits for the next one`() = runBlocking {
+    val sender = FakeSender()
+    sender.forceRunning()
+    sender.resizeCache(1)
+    sender.send(0, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    sender.send(1, MediaFrame.Type.VIDEO)
+    sender.send(2, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    assertEquals(listOf(0L), sender.drain())
+
+    sender.send(3, MediaFrame.Type.VIDEO)
+    sender.send(4, MediaFrame.Type.VIDEO, isKeyFrame = true)
+
+    assertEquals(listOf(4L), sender.drain())
+    assertEquals(3L, sender.getDroppedVideoFrames())
+  }
+
+  @Test
+  fun `GIVEN no keyframe WHEN the wait limit passes THEN video is sent again`() = runBlocking {
+    val sender = FakeSender()
+    sender.forceRunning()
+    sender.resizeCache(1)
+    sender.send(0, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    sender.send(1, MediaFrame.Type.VIDEO)
+    assertEquals(listOf(0L), sender.drain())
+
+    val limit = BaseSender.KEYFRAME_WAIT_LIMIT_US
+    sender.send(limit, MediaFrame.Type.VIDEO)
+    sender.send(1 + limit, MediaFrame.Type.VIDEO)
+
+    assertEquals(listOf(1 + limit), sender.drain())
+  }
+
+  @Test
+  fun `GIVEN video waits for a keyframe WHEN the sender stops THEN the next stream does not wait`() = runBlocking {
+    val sender = FakeSender()
+    sender.forceRunning()
+    sender.resizeCache(1)
+    sender.send(0, MediaFrame.Type.VIDEO, isKeyFrame = true)
+    sender.send(1, MediaFrame.Type.VIDEO)
+
+    sender.stop()
+    sender.forceRunning()
+    sender.send(2, MediaFrame.Type.VIDEO)
+
+    assertEquals(listOf(2L), sender.drain())
   }
 }

@@ -28,6 +28,14 @@ abstract class BaseSender(
     protected val TAG: String
 ) {
 
+    companion object {
+        /**
+         * Longest wait for a keyframe after a dropped video frame (frame timestamps, us). Then video
+         * is sent again even without a keyframe, so a keyframe that never comes can't freeze it.
+         */
+        internal const val KEYFRAME_WAIT_LIMIT_US = 5_000_000L
+    }
+
     @Volatile
     protected var running = false
 
@@ -38,6 +46,11 @@ abstract class BaseSender(
     protected val videoFramesSent = AtomicLong(0)
     private val droppedAudioFrames = AtomicLong(0)
     private val droppedVideoFrames = AtomicLong(0)
+
+    //a video frame was dropped, so video is dropped until the next keyframe
+    @Volatile
+    private var waitingForKeyFrame = false
+    private var keyFrameWaitStartTs = 0L
 
     private val bitrateManager: BitrateManager = BitrateManager(connectChecker)
     private val streamingStatsMonitor: StreamingStatsMonitor = StreamingStatsMonitor(connectChecker)
@@ -53,16 +66,32 @@ abstract class BaseSender(
     protected abstract suspend fun onRun()
     protected abstract suspend fun stopImp(clear: Boolean = true)
 
+    /**
+     * When the queue is full the frame is dropped. Video frames reference the previous ones, so
+     * after a dropped video frame the next ones are dropped too until a keyframe: the receiver
+     * shows a short freeze instead of a broken picture until the next keyframe. Audio frames
+     * don't depend on each other and keep going.
+     */
     fun sendMediaFrame(buffer: ByteBuffer, info: MediaFrame.Info, type: MediaFrame.Type) {
         if (!running) return
+        if (type == MediaFrame.Type.VIDEO && waitingForKeyFrame) {
+            if (!info.isKeyFrame && info.timestamp - keyFrameWaitStartTs < KEYFRAME_WAIT_LIMIT_US) {
+                droppedVideoFrames.incrementAndGet()
+                return
+            }
+            waitingForKeyFrame = false
+            Log.i(TAG, "Video sent again after discarded frames, keyframe: ${info.isKeyFrame}")
+        }
         val data = bufferPool.acquire(buffer.limit())
         val mediaFrame = MediaFrame(buffer.clone(data), info, type)
         if (!queue.trySend(mediaFrame)) {
             bufferPool.release(mediaFrame.data)
             when (type) {
                 MediaFrame.Type.VIDEO -> {
-                    Log.i(TAG, "Video frame discarded")
+                    Log.i(TAG, "Video frame discarded, discarding video until the next keyframe")
                     droppedVideoFrames.incrementAndGet()
+                    keyFrameWaitStartTs = info.timestamp
+                    waitingForKeyFrame = true
                 }
                 MediaFrame.Type.AUDIO -> {
                     Log.i(TAG, "Audio frame discarded")
@@ -91,6 +120,7 @@ abstract class BaseSender(
         job?.cancelAndJoin()
         bitrateManager.reset()
         queue.clear { bufferPool.release(it.data) }
+        waitingForKeyFrame = false
         streamingStatsMonitor.reset()
         running = true
         job = scope.launch {
@@ -136,6 +166,7 @@ abstract class BaseSender(
         }
         job = null
         queue.clear { bufferPool.release(it.data) }
+        waitingForKeyFrame = false
         bufferPool.clear()
     }
 
