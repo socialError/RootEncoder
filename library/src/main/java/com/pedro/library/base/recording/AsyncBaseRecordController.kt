@@ -16,6 +16,7 @@
 package com.pedro.library.base.recording
 
 import android.media.MediaCodec
+import android.util.Log
 import com.pedro.common.AudioCodec
 import com.pedro.common.BitrateManager
 import com.pedro.common.BufferPool
@@ -31,6 +32,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -49,6 +51,9 @@ abstract class AsyncBaseRecordController : RecordController {
   companion object {
     const val TAG: String = "AsyncRecordController"
     private const val CAPACITY = 500
+    private const val AUDIO_CATCH_UP_TIMEOUT_MS = 300L
+    private const val AUDIO_CATCH_UP_POLL_MS = 10L
+    private const val NANOS_PER_MILLI = 1_000_000L
   }
 
   @Volatile
@@ -66,7 +71,10 @@ abstract class AsyncBaseRecordController : RecordController {
   private val scope = CoroutineScope(Dispatchers.IO)
   private var muxerChannel: Channel<MediaFrame>? = null
   private var muxerJob: Job? = null
+  /** Set by stopRecord() for stopRecordImp(): the muxer coroutine when it did not finish within the wait, else null. */
+  protected var unfinishedMuxerJob: Job? = null
   private val bufferPool = BufferPool()
+  private var audioCatchUp = StopAudioCatchUp()
 
   override fun setRequestKeyFrame(requestKeyFrame: RequestKeyFrame?) {
     this.myRequestKeyFrame = requestKeyFrame
@@ -141,10 +149,12 @@ abstract class AsyncBaseRecordController : RecordController {
   private fun sendFrame(buffer: ByteBuffer, info: MediaCodec.BufferInfo, type: MediaFrame.Type) {
     if (recordStatus == RecordController.Status.STOPPED) return
     val channel = muxerChannel ?: return
+    if (type == MediaFrame.Type.VIDEO && !audioCatchUp.acceptsVideo()) return
     val frameInfo = info.toMediaFrameInfo()
     val i = updateFormat(frameInfo)
     val frame = MediaFrame(buffer.clone(bufferPool.acquire(buffer.limit())), i, type)
     if (channel.trySend(frame).isFailure) bufferPool.release(frame.data)
+    else if (type == MediaFrame.Type.VIDEO) audioCatchUp.onVideoSent(i.timestamp)
   }
 
   override fun startRecord(
@@ -180,13 +190,19 @@ abstract class AsyncBaseRecordController : RecordController {
     tracks: RecordTracks
   ) {
     clearTimestamp()
+    audioCatchUp = StopAudioCatchUp()
     muxerChannel = Channel(CAPACITY)
     muxerJob = scope.launch {
       val channel = muxerChannel ?: return@launch
       for (frame in channel) {
         try {
           if (!isActive) break
-          onWriteFrame(frame)
+          if (frame.type == MediaFrame.Type.VIDEO) {
+            onWriteFrame(frame)
+          } else if (audioCatchUp.acceptsAudio(frame.info.timestamp)) {
+            onWriteFrame(frame)
+            audioCatchUp.onAudioWritten(frame.info.timestamp)
+          }
         } finally {
           bufferPool.release(frame.data)
           onFrameRecycled()
@@ -205,16 +221,37 @@ abstract class AsyncBaseRecordController : RecordController {
   }
 
   override fun stopRecord() {
+    if (shouldCatchUpAudioOnStop()) catchUpAudio()
     muxerChannel?.close()
     muxerChannel = null
-    muxerJob?.cancel()
-    runBlocking { withTimeoutOrNull(1000.milliseconds) { muxerJob?.join() } }
+    val job = muxerJob
+    job?.cancel()
+    runBlocking { withTimeoutOrNull(1000.milliseconds) { job?.join() } }
+    unfinishedMuxerJob = if (job != null && !job.isCompleted) job else null
     bufferPool.clear()
     recordStatus = RecordController.Status.STOPPED
     clearTimestamp()
     myRequestKeyFrame = null
     listener?.onStatusChange(recordStatus)
     stopRecordImp()
+  }
+
+  /**
+   * The video of the record ends at the stop request. The audio encoder and the channel are behind it, so the last
+   * 0.1-0.25 s of audio would be lost: the audio is written until it reaches the end of the video. The encoders
+   * deliver on their own threads, so waiting here does not block them.
+   */
+  private fun catchUpAudio() {
+    val targetUs = audioCatchUp.closeVideo()
+    val startMs = System.nanoTime() / NANOS_PER_MILLI
+    val caughtUp = runBlocking {
+      withTimeoutOrNull(AUDIO_CATCH_UP_TIMEOUT_MS.milliseconds) {
+        while (!audioCatchUp.isCaughtUp()) delay(AUDIO_CATCH_UP_POLL_MS)
+        true
+      }
+    } == true
+    val waitedMs = System.nanoTime() / NANOS_PER_MILLI - startMs
+    Log.i(TAG, "stop audio ${if (caughtUp) "caught up" else "timed out"} after ${waitedMs}ms, video end ${targetUs}us")
   }
 
   private fun clearTimestamp() {
@@ -227,6 +264,9 @@ abstract class AsyncBaseRecordController : RecordController {
   abstract fun startRecordImp(path: String, listener: RecordController.Listener?, tracks: RecordTracks)
   abstract fun stopRecordImp()
   abstract suspend fun onWriteFrame(frame: MediaFrame)
+
+  /** True when stopRecord() must first write the audio that is still behind the video. */
+  protected open fun shouldCatchUpAudioOnStop(): Boolean = false
 
   /**
    * Called once the frame buffer went back to the pool, right after onWriteFrame.

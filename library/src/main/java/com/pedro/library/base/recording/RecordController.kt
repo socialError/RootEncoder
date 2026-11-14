@@ -48,11 +48,28 @@ interface RecordController {
   fun setRequestKeyFrame(requestKeyFrame: RequestKeyFrame?)
   fun getStatus(): Status
 
+  /**
+   * Ends the current file at the next video keyframe and continues in [path] without stopping encoders.
+   * @return false when not supported (default) or not possible now.
+   */
+  @Throws(IOException::class)
+  fun switchRecord(path: String, listener: SwitchListener): Boolean = false
+
   fun interface Listener : BitrateChecker {
     fun onStatusChange(status: Status)
     fun onError(e: Exception?) {
       Log.i(AsyncBaseRecordController.TAG, "Write error", e)
     }
+  }
+
+  fun interface SwitchListener {
+    /**
+     * Once per switch whose keyframe arrived. Called from a background thread, or from the thread
+     * calling stopRecord() if the record stops first; either way before stopRecord() returns.
+     * splitElapsedMs: TimeUtils.getCurrentTimeMillis() (elapsed realtime) when the split was applied, to tell which moments are in the finished file.
+     * error != null: finishing [finishedPath] failed, the file may be unusable.
+     */
+    fun onRecordSwitched(finishedPath: String, newPath: String, switchDelayUs: Long, splitElapsedMs: Long, error: Exception?)
   }
 
   fun interface RequestKeyFrame {

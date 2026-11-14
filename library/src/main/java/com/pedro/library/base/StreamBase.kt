@@ -51,6 +51,7 @@ import com.pedro.library.util.PreviewCallback
 import com.pedro.library.util.streamclient.StreamBaseClient
 import com.pedro.library.view.GlStreamInterface
 import com.pedro.library.view.preview.MultiPreviewConfig
+import java.io.IOException
 import java.nio.ByteBuffer
 import kotlin.math.max
 
@@ -279,6 +280,23 @@ abstract class StreamBase(
     }
     recordController.startRecord(path, listener, usedTracks)
     if (!isStreaming) startSources()
+  }
+
+  /**
+   * Ends the current record file at the next video keyframe and continues in [path] without
+   * stopping the encoders, so no frame is lost between the files.
+   *
+   * @return true if the switch is scheduled. False if not supported or not possible now.
+   */
+  @Throws(IOException::class)
+  fun switchRecord(path: String, listener: RecordController.SwitchListener): Boolean {
+    val scheduled = recordController.switchRecord(path, listener)
+    if (scheduled) requestRecordKeyframe()
+    return scheduled
+  }
+
+  private fun requestRecordKeyframe() {
+    if (differentRecordResolution) videoEncoderRecord.requestKeyframe() else videoEncoder.requestKeyframe()
   }
 
   /**
