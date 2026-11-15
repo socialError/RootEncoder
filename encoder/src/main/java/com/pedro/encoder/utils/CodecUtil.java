@@ -403,12 +403,17 @@ public class CodecUtil {
 
   @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
   public static boolean isCBRModeSupported(MediaCodecInfo mediaCodecInfo, String mime) {
+    return isBitrateModeSupported(mediaCodecInfo, mime,
+        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+  }
+
+  @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
+  public static boolean isBitrateModeSupported(MediaCodecInfo mediaCodecInfo, String mime, int mode) {
     MediaCodecInfo.CodecCapabilities codecCapabilities = getCapabilities(mediaCodecInfo, mime);
     if (codecCapabilities == null) return false;
     MediaCodecInfo.EncoderCapabilities encoderCapabilities = codecCapabilities.getEncoderCapabilities();
     if (encoderCapabilities == null) return false;
-    return encoderCapabilities.isBitrateModeSupported(
-        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+    return encoderCapabilities.isBitrateModeSupported(mode);
   }
 
   public static MediaCodecInfo.CodecCapabilities getCapabilities(MediaCodecInfo mediaCodecInfo, String mime) {

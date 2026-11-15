@@ -51,6 +51,11 @@ import java.util.List;
 
 public class VideoEncoder extends BaseEncoder implements GetCameraData {
 
+  /** Requested mode: CBR if the codec supports it, otherwise the codec default. */
+  public static final int BITRATE_MODE_DEFAULT = -1;
+  /** Applied mode: KEY_BITRATE_MODE was not set on the format. */
+  public static final int BITRATE_MODE_NOT_SET = -1;
+
   private final GetVideoData getVideoData;
   private volatile boolean spsPpsSetted = false;
   private boolean forceKey = false;
@@ -74,6 +79,8 @@ public class VideoEncoder extends BaseEncoder implements GetCameraData {
   private int level = -1;
   private final SpsColorPatcher spsColorPatcher = new SpsColorPatcher();
   private boolean forceBt709Color = false;
+  private int bitrateMode = BITRATE_MODE_DEFAULT;
+  private int appliedBitrateMode = BITRATE_MODE_NOT_SET;
 
   public VideoEncoder(GetVideoData getVideoData) {
     this.getVideoData = getVideoData;
@@ -95,6 +102,7 @@ public class VideoEncoder extends BaseEncoder implements GetCameraData {
       int iFrameInterval, FormatVideoEncoder formatVideoEncoder, int profile,
       int level) {
     if (prepared) stop();
+    appliedBitrateMode = BITRATE_MODE_NOT_SET;
 
     if (width % 2 != 0) {
       throw new IllegalArgumentException("Invalid width: " + width + ", must be an even value");
@@ -149,13 +157,16 @@ public class VideoEncoder extends BaseEncoder implements GetCameraData {
       videoFormat.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
       videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
       videoFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval);
-      //Set CBR mode if supported by encoder.
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && CodecUtil.isCBRModeSupported(encoder, type.getMime())) {
-        Log.i(TAG, "set bitrate mode CBR");
-        videoFormat.setInteger(MediaFormat.KEY_BITRATE_MODE,
-            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
-      } else {
-        Log.i(TAG, "bitrate mode CBR not supported using default mode");
+      //Set requested bitrate mode if supported by encoder, otherwise CBR if supported.
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        boolean requestedSupported = bitrateMode != BITRATE_MODE_DEFAULT
+            && CodecUtil.isBitrateModeSupported(encoder, type.getMime(), bitrateMode);
+        boolean cbrSupported = CodecUtil.isCBRModeSupported(encoder, type.getMime());
+        appliedBitrateMode = BitrateModeSelector.select(bitrateMode, requestedSupported, cbrSupported);
+        if (appliedBitrateMode != BITRATE_MODE_NOT_SET) {
+          videoFormat.setInteger(MediaFormat.KEY_BITRATE_MODE, appliedBitrateMode);
+        }
+        Log.i(TAG, "bitrate mode requested " + bitrateMode + ", applied " + appliedBitrateMode);
       }
       // Rotation by encoder.
       // Removed because this is ignored by most encoders, producing different results on different devices
@@ -322,6 +333,23 @@ public class VideoEncoder extends BaseEncoder implements GetCameraData {
 
   public void setForceFps(int fps) {
     fpsLimiter.setFPS(fps);
+  }
+
+  /**
+   * @param mode MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_* or BITRATE_MODE_DEFAULT. Used by
+   * every following prepare/reset. Honoured only if the codec supports it, otherwise the default
+   * logic is used (CBR if supported). Unlike forceBt709Color it may be called when prepared.
+   */
+  public void setBitrateMode(int mode) {
+    this.bitrateMode = mode;
+  }
+
+  public int getBitrateMode() {
+    return bitrateMode;
+  }
+
+  public int getAppliedBitrateMode() {
+    return appliedBitrateMode;
   }
 
   public void forceBt709Color(boolean enabled) {

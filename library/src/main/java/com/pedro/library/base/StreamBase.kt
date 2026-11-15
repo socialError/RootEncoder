@@ -21,6 +21,7 @@ import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
+import android.util.Log
 import android.util.Size
 import android.view.Surface
 import android.view.SurfaceView
@@ -111,6 +112,8 @@ abstract class StreamBase(
    * @param recordFps fps of the record encoder. If it is different than fps, a separate record encoder is used
    * even with the same resolution. Stream is limited to fps and record and preview run at recordFps
    *
+   * @param recordWidth any value > 0 (also equal to width) uses a separate record encoder
+   *
    * @throws IllegalArgumentException if current video parameters are not supported by the VideoSource
    * @throws IllegalArgumentException if you use differentRecordResolution but the aspect ratio is not the same than stream resolution
    * @return True if success, False if failed
@@ -136,6 +139,8 @@ abstract class StreamBase(
       }
       differentRecordResolution = true
     }
+    //a record encoder left configured by an earlier prepare must not run next to a single encoder (stop is safe on a never prepared encoder)
+    if (!differentRecordResolution) videoEncoderRecord.stop()
     val videoResult = videoSource.init(max(width, finalRecordWidth), max(height, finalRecordHeight), max(fps, recordFps), rotation)
     if (videoResult) {
       if (differentRecordResolution) {
@@ -156,6 +161,10 @@ abstract class StreamBase(
       }
       val result = videoEncoder.prepareVideoEncoder(width, height, fps, bitrate, rotation,
         iFrameInterval, FormatVideoEncoder.SURFACE, profile, level)
+      //a failed stream encoder must not leave the record codec, surface and handler thread configured
+      if (!result && differentRecordResolution) videoEncoderRecord.stop()
+      val recordBitrateMode = if (differentRecordResolution) videoEncoderRecord.appliedBitrateMode else VideoEncoder.BITRATE_MODE_NOT_SET
+      Log.i(TAG, "prepareVideo: separate record encoder $differentRecordResolution, stream bitrate mode ${videoEncoder.appliedBitrateMode}, record bitrate mode $recordBitrateMode")
       forceFpsLimit(true)
       return result
     }
@@ -497,6 +506,26 @@ abstract class StreamBase(
   }
 
   /**
+   * Bitrate mode of the main (stream) encoder. Without a separate record encoder it also writes the file.
+   * Call before prepareVideo, the value is kept for every following prepare/reset.
+   *
+   * @param mode MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_* or VideoEncoder.BITRATE_MODE_DEFAULT
+   */
+  fun setBitrateMode(mode: Int) {
+    videoEncoder.setBitrateMode(mode)
+  }
+
+  /**
+   * Bitrate mode of the record encoder, used only when prepareVideo gets recordWidth/recordHeight > 0
+   * or a different recordFps.
+   *
+   * @param mode MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_* or VideoEncoder.BITRATE_MODE_DEFAULT
+   */
+  fun setRecordBitrateMode(mode: Int) {
+    videoEncoderRecord.setBitrateMode(mode)
+  }
+
+  /**
    * @param callback get fps while record or stream
    */
   fun setFpsListener(callback: FpsListener.Callback?) {
@@ -697,4 +726,8 @@ abstract class StreamBase(
 
   protected abstract fun setVideoCodecImp(codec: VideoCodec)
   protected abstract fun setAudioCodecImp(codec: AudioCodec)
+
+  companion object {
+    private const val TAG = "StreamBase"
+  }
 }
