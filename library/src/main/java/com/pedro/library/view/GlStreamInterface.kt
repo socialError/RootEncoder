@@ -295,9 +295,13 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
       OrientationForced.LANDSCAPE -> false
       OrientationForced.NONE -> isPortraitPreview
     }
+    var filtersDrawnForOutput = false
     if (surfaceManagerEncoder.isReady || surfaceManagerEncoderRecord.isReady || surfaceManagerPhoto.isReady) {
       mainRender.drawFilters(false)
+      filtersDrawnForOutput = true
     }
+    // filters are full-frame passes: with the same filters for preview and output, draw them once per frame
+    val skipPreviewFilters = filtersDrawnForOutput && mainRender.previewFiltersMatchOutput()
     // render VideoEncoder (stream and record)
     if (surfaceManagerEncoder.isReady && mainRender.isReady() && !limitStreamFps) {
       val w = if (muteVideo) 0 else encoderWidth
@@ -335,7 +339,7 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
     if (surfaceManagerPreview.isReady && mainRender.isReady() && !limitPreviewFps) {
       val w =  if (previewWidth == 0) encoderWidth else previewWidth
       val h =  if (previewHeight == 0) encoderHeight else previewHeight
-      if (surfaceManager.makeCurrent()) {
+      if (!skipPreviewFilters && surfaceManager.makeCurrent()) {
         mainRender.drawFilters(true)
         surfaceManager.swapBuffer()
       }
@@ -348,7 +352,7 @@ class GlStreamInterface(private val context: Context): OnFrameAvailableListener,
     // render extra multi-preview surfaces (using independent configuration from PreviewSurfaceInfo)
     if (multiPreviewSurfaceManagers.isNotEmpty() && mainRender.isReady() && !limitPreviewFps) {
       // Only draw filters if default preview is not active (to avoid double drawing)
-      if (!surfaceManagerPreview.isReady) {
+      if (!surfaceManagerPreview.isReady && !skipPreviewFilters) {
         if (surfaceManager.makeCurrent()) {
           mainRender.drawFilters(true)
           surfaceManager.swapBuffer()

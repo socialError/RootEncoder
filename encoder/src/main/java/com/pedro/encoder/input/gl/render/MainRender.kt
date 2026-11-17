@@ -17,6 +17,7 @@
 package com.pedro.encoder.input.gl.render
 
 import android.content.Context
+import androidx.annotation.VisibleForTesting
 import android.graphics.SurfaceTexture
 import android.os.Build
 import android.view.Surface
@@ -59,6 +60,18 @@ class MainRender {
 
   fun drawSource() {
     cameraRender.draw()
+  }
+
+  /**
+   * True when the preview pass would draw exactly the filters the encoder pass draws (every filter is
+   * RenderMode.ALL), so after an encoder pass in the same frame the filter textures already hold the result.
+   */
+  fun previewFiltersMatchOutput(): Boolean = previewFiltersMatchOutput(filterRenders)
+
+  companion object {
+    @VisibleForTesting
+    internal fun previewFiltersMatchOutput(filters: List<BaseFilterRender>): Boolean =
+      filters.all { it.renderMode == RenderMode.ALL }
   }
 
   fun drawFilters(isPreview: Boolean) {
