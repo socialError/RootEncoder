@@ -588,9 +588,6 @@ class RtmpClient(private val connectChecker: ConnectChecker) {
       reTries = numRetry
       doingRetry = false
       isStreaming = false
-      onMainThread {
-        connectChecker.onDisconnect()
-      }
       jobRetry?.cancelAndJoin()
       jobRetry = null
       scopeRetry.cancel()
@@ -605,6 +602,12 @@ class RtmpClient(private val connectChecker: ConnectChecker) {
     publishPermitted = false
     commandsManager.reset()
     rtt = 0
+    // last, after the old connect job is cancelled: a connect() started from the callback must not be torn down
+    if (clear) {
+      onMainThread {
+        connectChecker.onDisconnect()
+      }
+    }
   }
 
   fun sendVideo(videoBuffer: ByteBuffer, info: MediaCodec.BufferInfo) {

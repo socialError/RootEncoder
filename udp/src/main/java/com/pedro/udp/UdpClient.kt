@@ -206,9 +206,6 @@ class UdpClient(private val connectChecker: ConnectChecker) {
       reTries = numRetry
       doingRetry = false
       isStreaming = false
-      onMainThread {
-        connectChecker.onDisconnect()
-      }
       jobRetry?.cancelAndJoin()
       jobRetry = null
       scopeRetry.cancel()
@@ -219,6 +216,12 @@ class UdpClient(private val connectChecker: ConnectChecker) {
     job = null
     scope.cancel()
     scope = CoroutineScope(Dispatchers.IO)
+    // last, after the old connect job is cancelled: a connect() started from the callback must not be torn down
+    if (clear) {
+      onMainThread {
+        connectChecker.onDisconnect()
+      }
+    }
   }
 
   fun reConnect(delay: Long) {

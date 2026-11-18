@@ -444,9 +444,6 @@ class RtspClient(private val connectChecker: ConnectChecker) {
       reTries = numRetry
       doingRetry = false
       isStreaming = false
-      onMainThread {
-        connectChecker.onDisconnect()
-      }
       mutex = Mutex(true)
       jobRetry?.cancelAndJoin()
       jobRetry = null
@@ -459,6 +456,12 @@ class RtspClient(private val connectChecker: ConnectChecker) {
     job = null
     scope.cancel()
     scope = CoroutineScope(Dispatchers.IO)
+    // last, after the old connect job is cancelled: a connect() started from the callback must not be torn down
+    if (clear) {
+      onMainThread {
+        connectChecker.onDisconnect()
+      }
+    }
   }
 
   fun sendVideo(videoBuffer: ByteBuffer, info: MediaCodec.BufferInfo) {
