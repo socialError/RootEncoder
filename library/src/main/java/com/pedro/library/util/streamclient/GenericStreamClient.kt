@@ -155,6 +155,15 @@ class GenericStreamClient(
     srtClient.setCheckServerAlive(enabled)
   }
 
+  /**
+   * SRT only: report onConnectionFailed("No response from server") if the server sends nothing
+   * for [millis] (0 = disabled, the default).
+   * See [com.pedro.srt.srt.SrtClient.setServerSilenceTimeout].
+   */
+  fun setServerSilenceTimeout(millis: Long) {
+    srtClient.setServerSilenceTimeout(millis)
+  }
+
   override fun resizeCache(newSize: Int) {
     rtmpClient.resizeCache(newSize)
     rtspClient.resizeCache(newSize)
